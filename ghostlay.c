@@ -2,7 +2,7 @@
  * ghostlay.c v4.0 — click-through image overlay for X11
  *
  * Modes: compositor ARGB | dither+XShape (-d) | fallback dimmed
- * Controls: Alt+Drag=move, Alt+Plus/Minus=resize, Alt+Q=quit
+ * Controls: Alt+Drag=move, Alt+/-=resize, Shift+Alt+/-=opacity, Alt+Q=quit
  *
  * gcc -O2 -std=c11 -Wall -Wextra -Wpedantic ghostlay.c -o ghostlay \
  *   -lX11 -lXext -lXrender -lpng -ljpeg -lm
@@ -35,7 +35,8 @@
 #include <sys/select.h>
 #include <unistd.h>
 
-#define VERSION       "4.0.0"
+#define VERSION       "4.1.0"
+#define OPACITY_STEP  0.05
 #define MAX_IMG_DIM   200000
 #define MAX_SCALE_DIM 20000
 #define MIN_DIM       20
@@ -732,8 +733,13 @@ static void ctx_init(Ctx *c, int w, int h, int dither)
         XKeysymToKeycode(c->dpy, XK_KP_Subtract),
         XKeysymToKeycode(c->dpy, XK_q)
     };
-    unsigned mods[] = {Mod1Mask, Mod1Mask | Mod2Mask};
-    for (int m = 0; m < 2; m++) {
+    unsigned mods[] = {
+        Mod1Mask,
+        Mod1Mask | Mod2Mask,
+        Mod1Mask | ShiftMask,
+        Mod1Mask | ShiftMask | Mod2Mask
+    };
+    for (int m = 0; m < 4; m++) {
         for (int k = 0; k < 6; k++) {
             if (keys[k])
                 XGrabKey(c->dpy, keys[k], mods[m], c->root,
@@ -910,6 +916,37 @@ static void redraw(Ctx *c)
     XFlush(c->dpy);
 }
 
+static void rebuild_opacity(Ctx *c, double new_op)
+{
+    if (new_op < OPACITY_MIN) new_op = OPACITY_MIN;
+    if (new_op > 1.0) new_op = 1.0;
+    c->opacity = new_op;
+
+    Image scaled = scale_bilinear(c->src, c->cur_maxdim);
+
+    if (c->ximg) { XDestroyImage(c->ximg); c->ximg = NULL; }
+    if (c->pics) { XRenderFreePicture(c->dpy, c->pics); c->pics = 0; }
+    if (c->pms) { XFreePixmap(c->dpy, c->pms); c->pms = 0; }
+
+    if (c->has_shape)
+        shape_passthrough(c->dpy, c->win);
+
+    if (c->use_argb) {
+        upload_argb(c, scaled.rgba, c->opacity);
+        if (!c->has_comp)
+            apply_shape(c, scaled.rgba, c->opacity);
+    } else {
+        build_ximg(c, scaled.rgba, c->opacity);
+        apply_shape(c, scaled.rgba, c->opacity);
+    }
+
+    redraw(c);
+    image_free(&scaled);
+
+    int pct = (int)lround(c->opacity * 100);
+    fprintf(stderr, "ghostlay: opacity %d%%\n", pct);
+}
+
 static void rebuild_at_size(Ctx *c, int new_maxdim)
 {
     if (new_maxdim < MIN_DIM) new_maxdim = MIN_DIM;
@@ -976,12 +1013,20 @@ static void run_loop(Ctx *c)
 
             case KeyPress: {
                 KeySym ks = XLookupKeysym(&ev.xkey, 0);
-                if (ks == XK_plus || ks == XK_equal || ks == XK_KP_Add)
-                    rebuild_at_size(c, c->cur_maxdim + RESIZE_STEP);
-                else if (ks == XK_minus || ks == XK_KP_Subtract)
-                    rebuild_at_size(c, c->cur_maxdim - RESIZE_STEP);
-                else if (ks == XK_q || ks == XK_Q)
+                int shift = ev.xkey.state & ShiftMask;
+                if (ks == XK_plus || ks == XK_equal || ks == XK_KP_Add) {
+                    if (shift)
+                        rebuild_opacity(c, c->opacity + OPACITY_STEP);
+                    else
+                        rebuild_at_size(c, c->cur_maxdim + RESIZE_STEP);
+                } else if (ks == XK_minus || ks == XK_KP_Subtract) {
+                    if (shift)
+                        rebuild_opacity(c, c->opacity - OPACITY_STEP);
+                    else
+                        rebuild_at_size(c, c->cur_maxdim - RESIZE_STEP);
+                } else if (ks == XK_q || ks == XK_Q) {
                     g_running = 0;
+                }
                 break;
             }
 
@@ -1066,10 +1111,11 @@ static void usage(FILE *o)
         "  -d     Dither transparency (no compositor needed)\n"
         "  -h     Help\n\n"
         "Controls:\n"
-        "  Alt + Drag        Move overlay\n"
-        "  Alt + Plus/Minus  Resize overlay\n"
-        "  Alt + Q           Quit (works even in background)\n"
-        "  Ctrl+C / SIGTERM  Quit (foreground only)\n\n"
+        "  Alt + Drag              Move overlay\n"
+        "  Alt + Plus/Minus        Resize overlay\n"
+        "  Shift + Alt + Plus/Minus  Change opacity\n"
+        "  Alt + Q                 Quit (works even in background)\n"
+        "  Ctrl+C / SIGTERM        Quit (foreground only)\n\n"
         "Background exit:\n"
         "  Alt+Q  or  killall ghostlay\n\n"
         "Examples:\n"
@@ -1195,7 +1241,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "ghostlay: %dx%d -> %dx%d, opacity %d/10%s (pid %d)\n",
             src.w, src.h, scaled.w, scaled.h, olev,
             dith ? ", dither" : "", (int)getpid());
-    fprintf(stderr, "ghostlay: Alt+Drag=move  Alt+/-=resize  Alt+Q=quit\n");
+    fprintf(stderr, "ghostlay: Alt+Drag=move  Alt+/-=resize  Shift+Alt+/-=opacity  Alt+Q=quit\n");
 
     Ctx ctx;
     ctx_init(&ctx, scaled.w, scaled.h, dith);
