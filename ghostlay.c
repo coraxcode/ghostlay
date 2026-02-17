@@ -8,14 +8,12 @@
  *
  * Transparency modes:
  *   1. Compositor (picom/xfwm4/kwin/mutter): ARGB window + XRender premultiplied
- *      alpha — true per-pixel transparency. This is the default when a compositor
- *      is detected.
- *   2. Dither + XShape (-d flag): Ordered dithering simulates opacity by punching
- *      holes (transparent pixels) via XShape bounding mask. Works perfectly on
- *      bare X11 (i3wm, dwm, bspwm, etc.) without any compositor. The image
- *      appears semi-transparent because a percentage of pixels become invisible.
+ *      alpha — true per-pixel transparency. Default when compositor is detected.
+ *   2. Dither + XShape (-d flag): Ordered Bayer dithering simulates opacity by
+ *      punching holes via XShape bounding mask. Works on bare X11 (i3wm, dwm,
+ *      bspwm, etc.) without any compositor.
  *   3. Fallback (no compositor, no -d): RGB dimmed by opacity + ShapeBounding
- *      holes for alpha > 0.
+ *      holes for pixels with alpha > 0.
  *
  * Click-through:
  *   ShapeInput is set to empty on the visual window so all mouse events pass
@@ -24,7 +22,7 @@
  *
  * Usage:
  *   ghostlay -o 5 -s 500 /path/to/image.png
- *   ghostlay -d -o 3 -s 400 /path/to/image.png    (dither mode for i3wm etc.)
+ *   ghostlay -d -o 3 -s 400 /path/to/image.png   (dither mode for i3wm etc.)
  *
  * Options:
  *   -o N   Opacity 0..10 (10 = fully visible, 0 = almost invisible)
@@ -32,9 +30,11 @@
  *   -d     Use dither + XShape transparency (no compositor needed)
  *   -h     Show help
  *
- * Exit:
- *   Ctrl+C, SIGTERM, or kill the process.
- *   If running in background: kill $(pidof ghostlay)
+ * Exit methods:
+ *   - Foreground:  Ctrl+C
+ *   - Background:  kill $(cat ${XDG_RUNTIME_DIR:-/tmp}/ghostlay.pid)
+ *                  kill $(pidof ghostlay)
+ *                  killall ghostlay
  *
  * Build:
  *   gcc -O2 -std=c11 -Wall -Wextra -Wpedantic ghostlay.c -o ghostlay \
@@ -70,7 +70,7 @@
 /*  Constants                                                                 */
 /* ========================================================================== */
 
-#define GHOSTLAY_VERSION       "2.0.0"
+#define GHOSTLAY_VERSION       "2.1.0"
 #define MAX_IMAGE_DIM          200000
 #define MAX_SCALE_DIM          20000
 #define OPACITY_MIN_FACTOR     0.03
@@ -117,7 +117,14 @@ static void signal_handler(int sig)
     g_running = 0;
     if (g_wake_wr >= 0) {
         const uint8_t b = 0xFF;
-        (void)write(g_wake_wr, &b, 1);
+        /*
+         * write() is async-signal-safe per POSIX.
+         * Suppress warn_unused_result: in a signal handler there is nothing
+         * meaningful we can do if the pipe is full — g_running=0 is the
+         * primary shutdown flag and select() will also notice EINTR.
+         */
+        ssize_t ret = write(g_wake_wr, &b, 1);
+        (void)ret;
     }
 }
 
@@ -666,14 +673,6 @@ static Pixmap shape_mask_from_alpha(Display *dpy, Drawable d,
     return pm;
 }
 
-/*
- * Dithered bounding mask: Bayer 8x8 ordered dithering simulates opacity
- * by selectively making pixels visible or invisible via XShape.
- *
- * effective_opacity = (pixel_alpha / 255.0) * global_opacity
- * threshold = (Bayer8x8[y%8][x%8] + 0.5) / 64.0
- * pixel visible if effective_opacity > threshold
- */
 static Pixmap shape_mask_dithered(Display *dpy, Drawable d,
                                   const uint8_t *rgba, int w, int h,
                                   double opacity)
@@ -707,6 +706,21 @@ static Pixmap shape_mask_dithered(Display *dpy, Drawable d,
 }
 
 /* ========================================================================== */
+/*  Custom X error handler — suppress extension event warnings               */
+/* ========================================================================== */
+
+static int x_error_handler(Display *dpy, XErrorEvent *ev)
+{
+    (void)dpy;
+    (void)ev;
+    /* Silently ignore all X errors. The most common one is the
+     * "ignoring invalid extension event" from XShape/XRender when
+     * a compositor starts/stops and sends extension events that Xlib
+     * does not recognize. There is nothing to do about these. */
+    return 0;
+}
+
+/* ========================================================================== */
 /*  X11 overlay context                                                       */
 /* ========================================================================== */
 
@@ -730,6 +744,9 @@ typedef struct {
     int has_compositor;
     int use_argb;
     int use_dither;
+
+    /* XShape event base — used to identify and ignore shape notify events */
+    int shape_event_base;
 
     int dragging;
     int drag_origin_rx, drag_origin_ry;
@@ -811,15 +828,21 @@ static void overlay_init(OverlayCtx *ctx, int w, int h, int use_dither)
     ctx->dpy = XOpenDisplay(NULL);
     if (!ctx->dpy) die("cannot open X display (is $DISPLAY set?)");
 
+    /* Install custom error handler to suppress extension event warnings */
+    XSetErrorHandler(x_error_handler);
+
     ctx->screen = DefaultScreen(ctx->dpy);
     ctx->root   = RootWindow(ctx->dpy, ctx->screen);
     ctx->w = w;  ctx->h = h;
     ctx->drag_handle_size = DRAG_HANDLE_SIZE;
     ctx->use_dither = use_dither;
 
-    int ev = 0, err = 0;
-    ctx->has_shape  = XShapeQueryExtension(ctx->dpy, &ev, &err);
-    ctx->has_render = XRenderQueryExtension(ctx->dpy, &ev, &err);
+    int shape_ev = 0, shape_err = 0;
+    ctx->has_shape = XShapeQueryExtension(ctx->dpy, &shape_ev, &shape_err);
+    ctx->shape_event_base = shape_ev; /* store for event loop filtering */
+
+    int render_ev = 0, render_err = 0;
+    ctx->has_render = XRenderQueryExtension(ctx->dpy, &render_ev, &render_err);
     ctx->has_compositor = compositor_active(ctx->dpy, ctx->screen);
 
     Visual *vis = NULL;
@@ -1090,6 +1113,19 @@ static void overlay_loop(OverlayCtx *ctx)
             XEvent ev;
             XNextEvent(ctx->dpy, &ev);
 
+            /*
+             * Silently ignore XShape extension events (ShapeNotify).
+             * These are generated when the shape of our window changes
+             * and have event type = shape_event_base + ShapeNotify.
+             * Xlib prints "ignoring invalid extension event" if we
+             * don't handle them, which we suppress via XSetErrorHandler,
+             * but we also skip them here to avoid the switch default.
+             */
+            if (ctx->has_shape && ev.type >= ctx->shape_event_base &&
+                ev.type < ctx->shape_event_base + 2) {
+                continue;
+            }
+
             switch (ev.type) {
             case Expose:
                 if (ev.xexpose.count == 0) overlay_redraw(ctx);
@@ -1189,7 +1225,9 @@ static void print_usage(FILE *out)
         "  Drag the top-left corner to reposition the overlay.\n"
         "\n"
         "Exit:\n"
-        "  Ctrl+C, SIGTERM, or: kill $(pidof ghostlay)\n"
+        "  Foreground: Ctrl+C\n"
+        "  Background: kill $(pidof ghostlay)\n"
+        "              killall ghostlay\n"
         "\n"
         "Examples:\n"
         "  ghostlay -o 5 -s 500 reference.png           (with compositor)\n"
@@ -1199,7 +1237,12 @@ static void print_usage(FILE *out)
         "Notes:\n"
         "  With compositor (picom, xfwm4, kwin, mutter): true alpha blending.\n"
         "  With -d: ordered dithering via XShape (no compositor needed).\n"
-        "  Without either: fallback dimmed rendering with shape holes.\n",
+        "  Without either: fallback dimmed rendering with shape holes.\n"
+        "\n"
+        "  IMPORTANT: When using with a compositor in background mode:\n"
+        "    ghostlay -o 5 -s 500 image.png &\n"
+        "    picom &\n"
+        "  Start them separately so each can be killed independently.\n",
         GHOSTLAY_VERSION
     );
 }
@@ -1297,6 +1340,12 @@ int main(int argc, char **argv)
         fcntl(g_wake_wr, F_SETFD, FD_CLOEXEC);
     }
 
+    /*
+     * Signal handlers for SIGINT, SIGTERM, SIGHUP.
+     * SA_RESTART is NOT set: select() will return EINTR on signal delivery,
+     * which we handle by checking g_running.
+     * SIGHUP: clean exit when terminal closes (background mode).
+     */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
