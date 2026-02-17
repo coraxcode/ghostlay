@@ -1,44 +1,11 @@
 /*
- * ghostlay.c — Professional floating, click-through image overlay for X11 (Linux)
+ * ghostlay.c v4.0 — click-through image overlay for X11
  *
- * Purpose:
- *   Display an always-on-top reference image with adjustable opacity and size,
- *   allowing the user to trace/copy over it without blocking normal interaction
- *   with underlying applications (click-through).
+ * Modes: compositor ARGB | dither+XShape (-d) | fallback dimmed
+ * Controls: Alt+Drag=move, Alt+Plus/Minus=resize, Alt+Q=quit
  *
- * Transparency modes:
- *   1. Compositor (picom/xfwm4/kwin/mutter): ARGB window + XRender premultiplied
- *      alpha — true per-pixel transparency. Default when compositor is detected.
- *   2. Dither + XShape (-d flag): Ordered Bayer dithering simulates opacity by
- *      punching holes via XShape bounding mask. Works on bare X11 (i3wm, dwm,
- *      bspwm, etc.) without any compositor.
- *   3. Fallback (no compositor, no -d): RGB dimmed by opacity + ShapeBounding
- *      holes for pixels with alpha > 0.
- *
- * Click-through:
- *   ShapeInput is set to empty on the visual window so all mouse events pass
- *   through to the application underneath. An invisible InputOnly drag handle
- *   in the top-left corner allows repositioning.
- *
- * Usage:
- *   ghostlay -o 5 -s 500 /path/to/image.png
- *   ghostlay -d -o 3 -s 400 /path/to/image.png   (dither mode for i3wm etc.)
- *
- * Options:
- *   -o N   Opacity 0..10 (10 = fully visible, 0 = almost invisible)
- *   -s PX  Target max dimension in pixels (keeps aspect ratio)
- *   -d     Use dither + XShape transparency (no compositor needed)
- *   -h     Show help
- *
- * Exit methods:
- *   - Foreground:  Ctrl+C
- *   - Background:  kill $(cat ${XDG_RUNTIME_DIR:-/tmp}/ghostlay.pid)
- *                  kill $(pidof ghostlay)
- *                  killall ghostlay
- *
- * Build:
- *   gcc -O2 -std=c11 -Wall -Wextra -Wpedantic ghostlay.c -o ghostlay \
- *     -lX11 -lXext -lXrender -lpng -ljpeg -lm
+ * gcc -O2 -std=c11 -Wall -Wextra -Wpedantic ghostlay.c -o ghostlay \
+ *   -lX11 -lXext -lXrender -lpng -ljpeg -lm
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -46,6 +13,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
+#include <X11/keysym.h>
 #include <X11/cursorfont.h>
 #include <X11/extensions/shape.h>
 #include <X11/extensions/Xrender.h>
@@ -63,85 +31,68 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/select.h>
 #include <unistd.h>
 
-/* ========================================================================== */
-/*  Constants                                                                 */
-/* ========================================================================== */
+#define VERSION       "4.0.0"
+#define MAX_IMG_DIM   200000
+#define MAX_SCALE_DIM 20000
+#define MIN_DIM       20
+#define OPACITY_MIN   0.03
+#define RAISE_TICKS   4
+#define SELECT_US     250000
+#define RESIZE_STEP   40
 
-#define GHOSTLAY_VERSION       "2.1.0"
-#define MAX_IMAGE_DIM          200000
-#define MAX_SCALE_DIM          20000
-#define OPACITY_MIN_FACTOR     0.03
-#define DRAG_HANDLE_SIZE       48
-#define RAISE_INTERVAL_TICKS   4
-#define SELECT_TIMEOUT_USEC    250000
-
-/* ========================================================================== */
-/*  8x8 Bayer ordered dither matrix (thresholds 0..63)                        */
-/* ========================================================================== */
-
-static const uint8_t BAYER8x8[8][8] = {
-    {  0, 32,  8, 40,  2, 34, 10, 42 },
-    { 48, 16, 56, 24, 50, 18, 58, 26 },
-    { 12, 44,  4, 36, 14, 46,  6, 38 },
-    { 60, 28, 52, 20, 62, 30, 54, 22 },
-    {  3, 35, 11, 43,  1, 33,  9, 41 },
-    { 51, 19, 59, 27, 49, 17, 57, 25 },
-    { 15, 47,  7, 39, 13, 45,  5, 37 },
-    { 63, 31, 55, 23, 61, 29, 53, 21 }
+static const uint8_t BAYER8[8][8] = {
+    { 0,32, 8,40, 2,34,10,42}, {48,16,56,24,50,18,58,26},
+    {12,44, 4,36,14,46, 6,38}, {60,28,52,20,62,30,54,22},
+    { 3,35,11,43, 1,33, 9,41}, {51,19,59,27,49,17,57,25},
+    {15,47, 7,39,13,45, 5,37}, {63,31,55,23,61,29,53,21}
 };
 
-/* ========================================================================== */
-/*  Image structure                                                           */
-/* ========================================================================== */
-
 typedef struct {
-    int      w;
-    int      h;
+    int w, h;
     uint8_t *rgba;
 } Image;
 
-/* ========================================================================== */
-/*  Signal handling: self-pipe for clean shutdown                             */
-/* ========================================================================== */
+/* --- signals & X error --- */
 
 static volatile sig_atomic_t g_running = 1;
 static int g_wake_rd = -1;
 static int g_wake_wr = -1;
 
-static void signal_handler(int sig)
+static void sig_handler(int s)
 {
-    (void)sig;
+    (void)s;
     g_running = 0;
     if (g_wake_wr >= 0) {
-        const uint8_t b = 0xFF;
-        /*
-         * write() is async-signal-safe per POSIX.
-         * Suppress warn_unused_result: in a signal handler there is nothing
-         * meaningful we can do if the pipe is full — g_running=0 is the
-         * primary shutdown flag and select() will also notice EINTR.
-         */
-        ssize_t ret = write(g_wake_wr, &b, 1);
-        (void)ret;
+        ssize_t r = write(g_wake_wr, "\xff", 1);
+        (void)r;
     }
 }
 
-/* ========================================================================== */
-/*  Utility functions                                                         */
-/* ========================================================================== */
+static int xio_error(Display *d)
+{
+    (void)d;
+    fprintf(stderr, "ghostlay: X connection lost\n");
+    _exit(0);
+    return 0;
+}
+
+static int x_error(Display *d, XErrorEvent *e)
+{
+    (void)d;
+    (void)e;
+    return 0;
+}
+
+/* --- util --- */
 
 static void die(const char *msg)
 {
     fprintf(stderr, "ghostlay: %s\n", msg);
-    exit(EXIT_FAILURE);
-}
-
-static void die_errno(const char *msg, const char *detail)
-{
-    fprintf(stderr, "ghostlay: %s '%s': %s\n", msg, detail, strerror(errno));
-    exit(EXIT_FAILURE);
+    exit(1);
 }
 
 static void *xmalloc(size_t n)
@@ -151,210 +102,188 @@ static void *xmalloc(size_t n)
     return p;
 }
 
-static void *xcalloc(size_t count, size_t size)
+static void *xcalloc(size_t n, size_t s)
 {
-    void *p = calloc(count, size);
+    void *p = calloc(n, s);
     if (!p) die("out of memory");
     return p;
 }
 
-static uint8_t clamp_u8(int v)
+static uint8_t clamp8(int v)
 {
-    if (v < 0)   return 0;
+    if (v < 0) return 0;
     if (v > 255) return 255;
     return (uint8_t)v;
 }
 
 static void image_free(Image *img)
 {
-    if (!img) return;
-    free(img->rgba);
-    img->rgba = NULL;
-    img->w = 0;
-    img->h = 0;
+    if (img) {
+        free(img->rgba);
+        img->rgba = NULL;
+        img->w = 0;
+        img->h = 0;
+    }
 }
 
-/* ========================================================================== */
-/*  Endianness and pixel format helpers                                       */
-/* ========================================================================== */
+/* --- pixel format --- */
 
-static int host_is_little_endian(void)
+static int host_le(void)
 {
-    const uint16_t probe = 0x0001;
-    return *(const uint8_t *)&probe == 0x01;
+    uint16_t x = 1;
+    return *(uint8_t *)&x;
 }
 
-static int mask_shift(uint32_t mask)
+static int mshift(uint32_t m)
 {
-    if (!mask) return 0;
+    if (!m) return 0;
     int s = 0;
-    while ((mask & 1u) == 0u) { mask >>= 1; s++; }
+    while (!(m & 1)) { m >>= 1; s++; }
     return s;
 }
 
-static int mask_bits(uint32_t mask)
+static int mbits(uint32_t m)
 {
     int b = 0;
-    while (mask) { b += (int)(mask & 1u); mask >>= 1; }
+    while (m) { b += m & 1; m >>= 1; }
     return b;
 }
 
-static uint32_t scale_channel(uint8_t val, int bits)
+static uint32_t schan(uint8_t v, int b)
 {
-    if (bits <= 0) return 0;
-    if (bits >= 8) return (uint32_t)val;
-    const uint32_t maxv = (1u << (uint32_t)bits) - 1u;
-    return ((uint32_t)val * maxv + 127u) / 255u;
+    if (b <= 0) return 0;
+    if (b >= 8) return v;
+    return ((uint32_t)v * ((1u << b) - 1) + 127) / 255;
 }
 
 typedef struct {
-    uint32_t rmask, gmask, bmask, amask;
-    int      rsh, gsh, bsh, ash;
-    int      rbits, gbits, bbits, abits;
-    int      byte_swap;
-    int      bpp;
-} PixelFormat;
+    uint32_t rm, gm, bm, am;
+    int rs, gs, bs, as;
+    int rb, gb, bb, ab;
+    int swap, bpp;
+} PxFmt;
 
-static uint32_t xrender_alpha_mask(const XRenderPictFormat *fmt)
+static uint32_t xr_amask(const XRenderPictFormat *f)
 {
-    if (!fmt || fmt->type != PictTypeDirect || fmt->direct.alphaMask == 0)
-        return 0;
-    return (uint32_t)fmt->direct.alphaMask << (uint32_t)fmt->direct.alpha;
+    if (!f || f->type != PictTypeDirect || !f->direct.alphaMask) return 0;
+    return (uint32_t)f->direct.alphaMask << f->direct.alpha;
 }
 
-static PixelFormat pixel_format_from_ximage(const XImage *xi,
-                                            const XRenderPictFormat *rfmt)
+static PxFmt make_pxfmt(const XImage *xi, const XRenderPictFormat *rf)
 {
-    PixelFormat pf;
-    memset(&pf, 0, sizeof(pf));
-
-    pf.rmask = (uint32_t)xi->red_mask;
-    pf.gmask = (uint32_t)xi->green_mask;
-    pf.bmask = (uint32_t)xi->blue_mask;
-    pf.amask = xrender_alpha_mask(rfmt);
-
-    pf.rsh   = mask_shift(pf.rmask);
-    pf.gsh   = mask_shift(pf.gmask);
-    pf.bsh   = mask_shift(pf.bmask);
-    pf.ash   = mask_shift(pf.amask);
-
-    pf.rbits = mask_bits(pf.rmask);
-    pf.gbits = mask_bits(pf.gmask);
-    pf.bbits = mask_bits(pf.bmask);
-    pf.abits = mask_bits(pf.amask);
-
-    pf.bpp = xi->bits_per_pixel / 8;
-    if (pf.bpp < 1) pf.bpp = 4;
-
-    int need_swap = 0;
-    if (host_is_little_endian()) {
-        if (xi->byte_order == MSBFirst) need_swap = 1;
-    } else {
-        if (xi->byte_order == LSBFirst) need_swap = 1;
-    }
-    pf.byte_swap = need_swap;
-
-    return pf;
+    PxFmt p;
+    memset(&p, 0, sizeof(p));
+    p.rm = (uint32_t)xi->red_mask;
+    p.gm = (uint32_t)xi->green_mask;
+    p.bm = (uint32_t)xi->blue_mask;
+    p.am = xr_amask(rf);
+    p.rs = mshift(p.rm);
+    p.gs = mshift(p.gm);
+    p.bs = mshift(p.bm);
+    p.as = mshift(p.am);
+    p.rb = mbits(p.rm);
+    p.gb = mbits(p.gm);
+    p.bb = mbits(p.bm);
+    p.ab = mbits(p.am);
+    p.bpp = xi->bits_per_pixel / 8;
+    if (p.bpp < 1) p.bpp = 4;
+    p.swap = host_le() ? (xi->byte_order == MSBFirst) : (xi->byte_order == LSBFirst);
+    return p;
 }
 
-static uint32_t pack_pixel(const PixelFormat *pf,
-                           uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+static uint32_t packpx(const PxFmt *p, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
 {
-    uint32_t pix = 0;
-    pix |= (scale_channel(r, pf->rbits) << (uint32_t)pf->rsh) & pf->rmask;
-    pix |= (scale_channel(g, pf->gbits) << (uint32_t)pf->gsh) & pf->gmask;
-    pix |= (scale_channel(b, pf->bbits) << (uint32_t)pf->bsh) & pf->bmask;
-    if (pf->amask)
-        pix |= (scale_channel(a, pf->abits) << (uint32_t)pf->ash) & pf->amask;
-
-    if (pf->byte_swap) {
-        pix = ((pix & 0x000000FFu) << 24) |
-              ((pix & 0x0000FF00u) <<  8) |
-              ((pix & 0x00FF0000u) >>  8) |
-              ((pix & 0xFF000000u) >> 24);
-    }
-    return pix;
+    uint32_t px = 0;
+    px |= (schan(r, p->rb) << p->rs) & p->rm;
+    px |= (schan(g, p->gb) << p->gs) & p->gm;
+    px |= (schan(b, p->bb) << p->bs) & p->bm;
+    if (p->am)
+        px |= (schan(a, p->ab) << p->as) & p->am;
+    if (p->swap)
+        px = (px >> 24) | ((px >> 8) & 0xFF00) | ((px << 8) & 0xFF0000) | (px << 24);
+    return px;
 }
 
-static void put_pixel_fast(char *data, int bytes_per_line,
-                           int x, int y, uint32_t pix, int bpp)
+static void putpx(char *data, int bpl, int x, int y, uint32_t px, int bpp)
 {
-    char *row = data + (size_t)y * (size_t)bytes_per_line;
+    char *row = data + (size_t)y * bpl;
     switch (bpp) {
-    case 4:  ((uint32_t *)(void *)row)[x] = pix; break;
-    case 3:
-        row[3 * x + 0] = (char)(pix & 0xFF);
-        row[3 * x + 1] = (char)((pix >> 8) & 0xFF);
-        row[3 * x + 2] = (char)((pix >> 16) & 0xFF);
+    case 4:
+        ((uint32_t *)(void *)row)[x] = px;
         break;
-    case 2:  ((uint16_t *)(void *)row)[x] = (uint16_t)(pix & 0xFFFF); break;
-    default: ((uint32_t *)(void *)row)[x] = pix; break;
+    case 2:
+        ((uint16_t *)(void *)row)[x] = (uint16_t)px;
+        break;
+    case 3:
+        row[3 * x + 0] = (char)(px & 0xFF);
+        row[3 * x + 1] = (char)((px >> 8) & 0xFF);
+        row[3 * x + 2] = (char)((px >> 16) & 0xFF);
+        break;
+    default:
+        ((uint32_t *)(void *)row)[x] = px;
+        break;
     }
 }
 
-/* ========================================================================== */
-/*  Format detection                                                          */
-/* ========================================================================== */
+/* --- format detect --- */
 
-static int file_read_bytes(FILE *f, uint8_t *buf, size_t n)
+static int freadn(FILE *f, uint8_t *b, size_t n)
 {
-    return fread(buf, 1, n, f) == n;
+    return fread(b, 1, n, f) == n;
 }
 
-static int detect_png(const char *path)
+static int is_png(const char *path)
 {
-    uint8_t sig[8];
+    uint8_t s[8];
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
-    int ok = file_read_bytes(f, sig, 8) && png_sig_cmp(sig, 0, 8) == 0;
+    int ok = freadn(f, s, 8) && !png_sig_cmp(s, 0, 8);
     fclose(f);
     return ok;
 }
 
-static int detect_jpeg(const char *path)
+static int is_jpeg(const char *path)
 {
-    uint8_t sig[3];
+    uint8_t s[3];
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
-    int ok = file_read_bytes(f, sig, 3) &&
-             sig[0] == 0xFF && sig[1] == 0xD8 && sig[2] == 0xFF;
+    int ok = freadn(f, s, 3) && s[0] == 0xFF && s[1] == 0xD8 && s[2] == 0xFF;
     fclose(f);
     return ok;
 }
 
-/* ========================================================================== */
-/*  PNG loader                                                                */
-/* ========================================================================== */
+/* --- PNG loader --- */
 
 static Image load_png(const char *path)
 {
     Image img = {0, 0, NULL};
-
     FILE *fp = fopen(path, "rb");
-    if (!fp) die_errno("cannot open PNG", path);
-
-    uint8_t header[8];
-    if (!file_read_bytes(fp, header, 8) || png_sig_cmp(header, 0, 8) != 0) {
-        fclose(fp);
-        die("not a valid PNG file");
+    if (!fp) {
+        fprintf(stderr, "ghostlay: %s: %s\n", path, strerror(errno));
+        exit(1);
     }
 
-    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING,
-                                             NULL, NULL, NULL);
-    if (!png) { fclose(fp); die("png_create_read_struct failed"); }
+    uint8_t hdr[8];
+    if (!freadn(fp, hdr, 8) || png_sig_cmp(hdr, 0, 8)) {
+        fclose(fp);
+        die("not a valid PNG");
+    }
+
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) { fclose(fp); die("png init failed"); }
 
     png_infop info = png_create_info_struct(png);
     if (!info) {
         png_destroy_read_struct(&png, NULL, NULL);
         fclose(fp);
-        die("png_create_info_struct failed");
+        die("png info failed");
     }
 
     if (setjmp(png_jmpbuf(png))) {
         png_destroy_read_struct(&png, &info, NULL);
         fclose(fp);
         free(img.rgba);
-        die("error reading PNG data");
+        die("PNG read error");
     }
 
     png_init_io(png, fp);
@@ -362,51 +291,35 @@ static Image load_png(const char *path)
     png_read_info(png, info);
 
     png_uint_32 w = 0, h = 0;
-    int bit_depth = 0, color_type = 0;
-    png_get_IHDR(png, info, &w, &h, &bit_depth, &color_type, NULL, NULL, NULL);
-
-    if (w == 0 || h == 0 || w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM) {
+    int bd = 0, ct = 0;
+    png_get_IHDR(png, info, &w, &h, &bd, &ct, NULL, NULL, NULL);
+    if (!w || !h || w > MAX_IMG_DIM || h > MAX_IMG_DIM) {
         png_destroy_read_struct(&png, &info, NULL);
         fclose(fp);
-        die("PNG dimensions invalid or too large");
+        die("PNG too large");
     }
 
-    if (bit_depth == 16) png_set_strip_16(png);
-    if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
-    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8)
-        png_set_expand_gray_1_2_4_to_8(png);
+    if (bd == 16) png_set_strip_16(png);
+    if (ct == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+    if (ct == PNG_COLOR_TYPE_GRAY && bd < 8) png_set_expand_gray_1_2_4_to_8(png);
     if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
-    if (color_type == PNG_COLOR_TYPE_GRAY ||
-        color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
-        png_set_gray_to_rgb(png);
-    if (!(color_type & PNG_COLOR_MASK_ALPHA))
-        png_set_add_alpha(png, 0xFF, PNG_FILLER_AFTER);
-
+    if (ct == PNG_COLOR_TYPE_GRAY || ct == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png);
+    if (!(ct & PNG_COLOR_MASK_ALPHA)) png_set_add_alpha(png, 0xFF, PNG_FILLER_AFTER);
     png_read_update_info(png, info);
-
-    png_size_t rowbytes = png_get_rowbytes(png, info);
-    if (rowbytes < (png_size_t)(w * 4)) {
-        png_destroy_read_struct(&png, &info, NULL);
-        fclose(fp);
-        die("unexpected PNG row size");
-    }
 
     img.w = (int)w;
     img.h = (int)h;
-
-    size_t total = (size_t)w * (size_t)h;
-    if (total > SIZE_MAX / 4) {
+    size_t tot = (size_t)w * h;
+    if (tot > SIZE_MAX / 4) {
         png_destroy_read_struct(&png, &info, NULL);
         fclose(fp);
-        die("image too large to allocate");
+        die("too large");
     }
-
-    img.rgba = (uint8_t *)xmalloc(total * 4);
+    img.rgba = (uint8_t *)xmalloc(tot * 4);
 
     png_bytep *rows = (png_bytep *)xmalloc(sizeof(png_bytep) * h);
     for (png_uint_32 y = 0; y < h; y++)
-        rows[y] = img.rgba + (size_t)y * (size_t)w * 4;
-
+        rows[y] = img.rgba + (size_t)y * w * 4;
     png_read_image(png, rows);
     png_read_end(png, NULL);
 
@@ -416,157 +329,157 @@ static Image load_png(const char *path)
     return img;
 }
 
-/* ========================================================================== */
-/*  JPEG loader                                                               */
-/* ========================================================================== */
+/* --- JPEG loader --- */
 
-struct JpegErrorCtx {
+struct JErr {
     struct jpeg_error_mgr pub;
-    jmp_buf               escape;
+    jmp_buf jb;
 };
 
-static void jpeg_error_handler(j_common_ptr cinfo)
+static void jerr_exit(j_common_ptr c)
 {
-    struct JpegErrorCtx *ctx = (struct JpegErrorCtx *)cinfo->err;
-    longjmp(ctx->escape, 1);
+    longjmp(((struct JErr *)c->err)->jb, 1);
 }
 
 static Image load_jpeg(const char *path)
 {
     Image img = {0, 0, NULL};
-
     FILE *fp = fopen(path, "rb");
-    if (!fp) die_errno("cannot open JPEG", path);
+    if (!fp) {
+        fprintf(stderr, "ghostlay: %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
 
-    struct jpeg_decompress_struct cinfo;
-    struct JpegErrorCtx jerr;
+    struct jpeg_decompress_struct ci;
+    struct JErr je;
+    ci.err = jpeg_std_error(&je.pub);
+    je.pub.error_exit = jerr_exit;
 
-    cinfo.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit = jpeg_error_handler;
-
-    if (setjmp(jerr.escape)) {
-        jpeg_destroy_decompress(&cinfo);
+    if (setjmp(je.jb)) {
+        jpeg_destroy_decompress(&ci);
         fclose(fp);
         free(img.rgba);
-        die("error reading JPEG data");
+        die("JPEG error");
     }
 
-    jpeg_create_decompress(&cinfo);
-    jpeg_stdio_src(&cinfo, fp);
-    jpeg_read_header(&cinfo, TRUE);
+    jpeg_create_decompress(&ci);
+    jpeg_stdio_src(&ci, fp);
+    jpeg_read_header(&ci, TRUE);
+    ci.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&ci);
 
-    cinfo.out_color_space = JCS_RGB;
-    jpeg_start_decompress(&cinfo);
-
-    img.w = (int)cinfo.output_width;
-    img.h = (int)cinfo.output_height;
-
-    if (img.w <= 0 || img.h <= 0 ||
-        img.w > MAX_IMAGE_DIM || img.h > MAX_IMAGE_DIM) {
-        jpeg_finish_decompress(&cinfo);
-        jpeg_destroy_decompress(&cinfo);
+    img.w = (int)ci.output_width;
+    img.h = (int)ci.output_height;
+    if (img.w <= 0 || img.h <= 0 || img.w > MAX_IMG_DIM || img.h > MAX_IMG_DIM) {
+        jpeg_finish_decompress(&ci);
+        jpeg_destroy_decompress(&ci);
         fclose(fp);
-        die("invalid JPEG dimensions");
+        die("JPEG too large");
     }
-
-    if (cinfo.output_components != 3) {
-        jpeg_finish_decompress(&cinfo);
-        jpeg_destroy_decompress(&cinfo);
+    if (ci.output_components != 3) {
+        jpeg_finish_decompress(&ci);
+        jpeg_destroy_decompress(&ci);
         fclose(fp);
-        die("unexpected JPEG color components");
+        die("unexpected JPEG components");
     }
 
-    size_t total = (size_t)img.w * (size_t)img.h;
-    if (total > SIZE_MAX / 4) {
-        jpeg_finish_decompress(&cinfo);
-        jpeg_destroy_decompress(&cinfo);
+    size_t tot = (size_t)img.w * img.h;
+    if (tot > SIZE_MAX / 4) {
+        jpeg_finish_decompress(&ci);
+        jpeg_destroy_decompress(&ci);
         fclose(fp);
-        die("image too large to allocate");
+        die("too large");
     }
+    img.rgba = (uint8_t *)xmalloc(tot * 4);
+    uint8_t *sl = (uint8_t *)xmalloc((size_t)img.w * 3);
 
-    img.rgba = (uint8_t *)xmalloc(total * 4);
-
-    size_t row_stride = (size_t)img.w * 3;
-    uint8_t *scanline = (uint8_t *)xmalloc(row_stride);
-
-    while (cinfo.output_scanline < cinfo.output_height) {
-        int y = (int)cinfo.output_scanline;
-        JSAMPROW row_ptr = scanline;
-        jpeg_read_scanlines(&cinfo, &row_ptr, 1);
-
-        uint8_t *dst = img.rgba + (size_t)y * (size_t)img.w * 4;
+    while (ci.output_scanline < ci.output_height) {
+        int y = (int)ci.output_scanline;
+        JSAMPROW rp = sl;
+        jpeg_read_scanlines(&ci, &rp, 1);
+        uint8_t *d = img.rgba + (size_t)y * img.w * 4;
         for (int x = 0; x < img.w; x++) {
-            dst[4 * x + 0] = scanline[3 * x + 0];
-            dst[4 * x + 1] = scanline[3 * x + 1];
-            dst[4 * x + 2] = scanline[3 * x + 2];
-            dst[4 * x + 3] = 255;
+            d[4 * x + 0] = sl[3 * x + 0];
+            d[4 * x + 1] = sl[3 * x + 1];
+            d[4 * x + 2] = sl[3 * x + 2];
+            d[4 * x + 3] = 255;
         }
     }
 
-    free(scanline);
-    jpeg_finish_decompress(&cinfo);
-    jpeg_destroy_decompress(&cinfo);
+    free(sl);
+    jpeg_finish_decompress(&ci);
+    jpeg_destroy_decompress(&ci);
     fclose(fp);
     return img;
 }
 
-/* ========================================================================== */
-/*  Unified image loader                                                      */
-/* ========================================================================== */
-
 static Image load_image(const char *path)
 {
-    if (detect_png(path))  return load_png(path);
-    if (detect_jpeg(path)) return load_jpeg(path);
-    fprintf(stderr, "ghostlay: unsupported format (expected PNG or JPEG): %s\n", path);
-    exit(EXIT_FAILURE);
+    if (is_png(path)) return load_png(path);
+    if (is_jpeg(path)) return load_jpeg(path);
+    fprintf(stderr, "ghostlay: unsupported format: %s\n", path);
+    exit(1);
 }
 
-/* ========================================================================== */
-/*  Bilinear scaling                                                          */
-/* ========================================================================== */
+/* --- bilinear scale --- */
 
-static Image scale_bilinear(const Image *src, int max_dim)
+static Image scale_bilinear(const Image *src, int maxd)
 {
-    if (max_dim <= 0 || (src->w <= max_dim && src->h <= max_dim)) {
-        Image out;
-        out.w = src->w;
-        out.h = src->h;
-        size_t total = (size_t)src->w * (size_t)src->h * 4;
-        out.rgba = (uint8_t *)xmalloc(total);
-        memcpy(out.rgba, src->rgba, total);
-        return out;
+    /*
+     * Scale so that the longer side equals maxd.
+     * Always scale, even if image is smaller (upscale).
+     * maxd <= 0 means no scaling.
+     */
+    if (maxd <= 0) {
+        Image o;
+        o.w = src->w;
+        o.h = src->h;
+        size_t t = (size_t)o.w * o.h * 4;
+        o.rgba = (uint8_t *)xmalloc(t);
+        memcpy(o.rgba, src->rgba, t);
+        return o;
     }
 
-    const int sw = src->w, sh = src->h;
-    const int longer = (sw > sh) ? sw : sh;
-    double ratio = (double)max_dim / (double)longer;
-    int dw = (int)lround((double)sw * ratio);
-    int dh = (int)lround((double)sh * ratio);
+    int sw = src->w, sh = src->h;
+    int longer = sw > sh ? sw : sh;
+    double ratio = (double)maxd / (double)longer;
+    int dw = (int)lround(sw * ratio);
+    int dh = (int)lround(sh * ratio);
     if (dw < 1) dw = 1;
     if (dh < 1) dh = 1;
 
-    size_t total = (size_t)dw * (size_t)dh;
-    if (total > SIZE_MAX / 4) die("scaled image too large");
+    /* If ratio is ~1.0 and dimensions match, just copy */
+    if (dw == sw && dh == sh) {
+        Image o;
+        o.w = sw;
+        o.h = sh;
+        size_t t = (size_t)sw * sh * 4;
+        o.rgba = (uint8_t *)xmalloc(t);
+        memcpy(o.rgba, src->rgba, t);
+        return o;
+    }
+
+    size_t tot = (size_t)dw * dh;
+    if (tot > SIZE_MAX / 4) die("scale too large");
 
     Image dst;
     dst.w = dw;
     dst.h = dh;
-    dst.rgba = (uint8_t *)xmalloc(total * 4);
+    dst.rgba = (uint8_t *)xmalloc(tot * 4);
 
     for (int y = 0; y < dh; y++) {
-        double fy = ((double)y + 0.5) * (double)sh / (double)dh - 0.5;
+        double fy = ((double)y + 0.5) * sh / dh - 0.5;
         int y0 = (int)floor(fy), y1 = y0 + 1;
-        double wy = fy - (double)y0;
-        if (y0 < 0)  { y0 = 0;      wy = 0.0; }
-        if (y1 >= sh) { y1 = sh - 1; }
+        double wy = fy - y0;
+        if (y0 < 0) { y0 = 0; wy = 0; }
+        if (y1 >= sh) y1 = sh - 1;
 
         for (int x = 0; x < dw; x++) {
-            double fx = ((double)x + 0.5) * (double)sw / (double)dw - 0.5;
+            double fx = ((double)x + 0.5) * sw / dw - 0.5;
             int x0 = (int)floor(fx), x1 = x0 + 1;
-            double wx = fx - (double)x0;
-            if (x0 < 0)  { x0 = 0;      wx = 0.0; }
-            if (x1 >= sw) { x1 = sw - 1; }
+            double wx = fx - x0;
+            if (x0 < 0) { x0 = 0; wx = 0; }
+            if (x1 >= sw) x1 = sw - 1;
 
             const uint8_t *p00 = src->rgba + 4 * ((size_t)y0 * sw + x0);
             const uint8_t *p10 = src->rgba + 4 * ((size_t)y0 * sw + x1);
@@ -575,763 +488,682 @@ static Image scale_bilinear(const Image *src, int max_dim)
             uint8_t *d = dst.rgba + 4 * ((size_t)y * dw + x);
 
             for (int c = 0; c < 4; c++) {
-                double v = (1.0 - wx) * (1.0 - wy) * (double)p00[c]
-                         + wx         * (1.0 - wy) * (double)p10[c]
-                         + (1.0 - wx) * wy         * (double)p01[c]
-                         + wx         * wy         * (double)p11[c];
-                d[c] = clamp_u8((int)lround(v));
+                double v = (1 - wx) * (1 - wy) * p00[c]
+                         + wx * (1 - wy) * p10[c]
+                         + (1 - wx) * wy * p01[c]
+                         + wx * wy * p11[c];
+                d[c] = clamp8((int)lround(v));
             }
         }
     }
     return dst;
 }
 
-/* ========================================================================== */
-/*  X11 compositor detection                                                  */
-/* ========================================================================== */
+/* --- X11 helpers --- */
 
-static int compositor_active(Display *dpy, int screen)
+static int comp_active(Display *d, int s)
 {
-    char name[64];
-    snprintf(name, sizeof(name), "_NET_WM_CM_S%d", screen);
-    Atom sel = XInternAtom(dpy, name, False);
-    if (sel == None) return 0;
-    return XGetSelectionOwner(dpy, sel) != None;
+    char n[64];
+    snprintf(n, 64, "_NET_WM_CM_S%d", s);
+    Atom a = XInternAtom(d, n, False);
+    return a != None && XGetSelectionOwner(d, a) != None;
 }
 
-/* ========================================================================== */
-/*  X11 ARGB visual selection                                                 */
-/* ========================================================================== */
-
-static Visual *find_argb_visual(Display *dpy, int screen, int *out_depth)
+static Visual *find_argb(Display *d, int s, int *dep)
 {
-    XVisualInfo tmpl;
-    tmpl.screen = screen;
-    tmpl.depth  = 32;
-    tmpl.class  = TrueColor;
-
-    int count = 0;
-    XVisualInfo *list = XGetVisualInfo(dpy,
-        VisualScreenMask | VisualDepthMask | VisualClassMask, &tmpl, &count);
-    if (!list || count == 0) {
-        if (list) XFree(list);
+    XVisualInfo t;
+    t.screen = s;
+    t.depth = 32;
+    t.class = TrueColor;
+    int c = 0;
+    XVisualInfo *l = XGetVisualInfo(d,
+        VisualScreenMask | VisualDepthMask | VisualClassMask, &t, &c);
+    if (!l || !c) {
+        if (l) XFree(l);
         return NULL;
     }
-
-    Visual *result = NULL;
-    for (int i = 0; i < count; i++) {
-        XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy, list[i].visual);
-        if (fmt && fmt->type == PictTypeDirect &&
-            fmt->direct.alphaMask != 0 && fmt->depth == 32) {
-            result = list[i].visual;
-            *out_depth = 32;
+    Visual *r = NULL;
+    for (int i = 0; i < c; i++) {
+        XRenderPictFormat *f = XRenderFindVisualFormat(d, l[i].visual);
+        if (f && f->type == PictTypeDirect && f->direct.alphaMask && f->depth == 32) {
+            r = l[i].visual;
+            *dep = 32;
             break;
         }
     }
-    XFree(list);
-    return result;
+    XFree(l);
+    return r;
 }
 
-/* ========================================================================== */
-/*  XShape helpers                                                            */
-/* ========================================================================== */
-
-static void shape_input_passthrough(Display *dpy, Window win)
+static void shape_passthrough(Display *d, Window w)
 {
-    char zero = 0;
-    Pixmap pm = XCreateBitmapFromData(dpy, win, &zero, 1, 1);
-    if (!pm) return;
-    XShapeCombineMask(dpy, win, ShapeInput, 0, 0, pm, ShapeSet);
-    XFreePixmap(dpy, pm);
+    char z = 0;
+    Pixmap p = XCreateBitmapFromData(d, w, &z, 1, 1);
+    if (p) {
+        XShapeCombineMask(d, w, ShapeInput, 0, 0, p, ShapeSet);
+        XFreePixmap(d, p);
+    }
 }
 
-static Pixmap shape_mask_from_alpha(Display *dpy, Drawable d,
-                                    const uint8_t *rgba, int w, int h)
+static Pixmap mask_alpha(Display *d, Drawable dr, const uint8_t *rgba, int w, int h)
 {
-    const int bit_order = BitmapBitOrder(dpy);
-    const int stride = (w + 7) / 8;
-    size_t sz = (size_t)stride * (size_t)h;
-    uint8_t *bits = (uint8_t *)xcalloc(sz, 1);
-
+    int bo = BitmapBitOrder(d);
+    int st = (w + 7) / 8;
+    uint8_t *b = (uint8_t *)xcalloc((size_t)st * h, 1);
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
-            uint8_t alpha = rgba[4 * ((size_t)y * w + x) + 3];
-            if (alpha > 0) {
-                int byte_idx = y * stride + (x >> 3);
-                int bit_idx  = x & 7;
-                if (bit_order == LSBFirst)
-                    bits[byte_idx] |= (uint8_t)(1u << (unsigned)bit_idx);
-                else
-                    bits[byte_idx] |= (uint8_t)(1u << (unsigned)(7 - bit_idx));
+            if (rgba[4 * ((size_t)y * w + x) + 3] > 0) {
+                int bi = y * st + (x >> 3);
+                int bt = x & 7;
+                b[bi] |= (uint8_t)(1u << (bo == LSBFirst ? bt : 7 - bt));
             }
         }
     }
-
-    Pixmap pm = XCreateBitmapFromData(dpy, d, (const char *)bits,
-                                      (unsigned)w, (unsigned)h);
-    free(bits);
-    return pm;
+    Pixmap p = XCreateBitmapFromData(d, dr, (char *)b, (unsigned)w, (unsigned)h);
+    free(b);
+    return p;
 }
 
-static Pixmap shape_mask_dithered(Display *dpy, Drawable d,
-                                  const uint8_t *rgba, int w, int h,
-                                  double opacity)
+static Pixmap mask_dither(Display *d, Drawable dr,
+                          const uint8_t *rgba, int w, int h, double op)
 {
-    const int bit_order = BitmapBitOrder(dpy);
-    const int stride = (w + 7) / 8;
-    size_t sz = (size_t)stride * (size_t)h;
-    uint8_t *bits = (uint8_t *)xcalloc(sz, 1);
-
+    int bo = BitmapBitOrder(d);
+    int st = (w + 7) / 8;
+    uint8_t *b = (uint8_t *)xcalloc((size_t)st * h, 1);
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
-            uint8_t alpha = rgba[4 * ((size_t)y * w + x) + 3];
-            double eff = ((double)alpha / 255.0) * opacity;
-            double threshold = ((double)BAYER8x8[y & 7][x & 7] + 0.5) / 64.0;
-
-            if (eff > threshold) {
-                int byte_idx = y * stride + (x >> 3);
-                int bit_idx  = x & 7;
-                if (bit_order == LSBFirst)
-                    bits[byte_idx] |= (uint8_t)(1u << (unsigned)bit_idx);
-                else
-                    bits[byte_idx] |= (uint8_t)(1u << (unsigned)(7 - bit_idx));
+            double ef = ((double)rgba[4 * ((size_t)y * w + x) + 3] / 255.0) * op;
+            if (ef > ((double)BAYER8[y & 7][x & 7] + 0.5) / 64.0) {
+                int bi = y * st + (x >> 3);
+                int bt = x & 7;
+                b[bi] |= (uint8_t)(1u << (bo == LSBFirst ? bt : 7 - bt));
             }
         }
     }
-
-    Pixmap pm = XCreateBitmapFromData(dpy, d, (const char *)bits,
-                                      (unsigned)w, (unsigned)h);
-    free(bits);
-    return pm;
+    Pixmap p = XCreateBitmapFromData(d, dr, (char *)b, (unsigned)w, (unsigned)h);
+    free(b);
+    return p;
 }
 
-/* ========================================================================== */
-/*  Custom X error handler — suppress extension event warnings               */
-/* ========================================================================== */
-
-static int x_error_handler(Display *dpy, XErrorEvent *ev)
-{
-    (void)dpy;
-    (void)ev;
-    /* Silently ignore all X errors. The most common one is the
-     * "ignoring invalid extension event" from XShape/XRender when
-     * a compositor starts/stops and sends extension events that Xlib
-     * does not recognize. There is nothing to do about these. */
-    return 0;
-}
-
-/* ========================================================================== */
-/*  X11 overlay context                                                       */
-/* ========================================================================== */
+/* --- overlay context --- */
 
 typedef struct {
     Display *dpy;
-    int      screen;
-    Window   root;
-    Visual  *visual;
-    int      depth;
+    int scr;
+    Window root, win;
+    Visual *vis;
+    int depth;
     Colormap cmap;
-
-    Window   win;
-    Window   drag_win;
-    Cursor   cursor_move;
-
+    Cursor cur_move;
     int w, h;
-    int drag_handle_size;
-
-    int has_shape;
-    int has_render;
-    int has_compositor;
-    int use_argb;
-    int use_dither;
-
-    /* XShape event base — used to identify and ignore shape notify events */
-    int shape_event_base;
-
-    int dragging;
-    int drag_origin_rx, drag_origin_ry;
-    int win_origin_x,   win_origin_y;
-
-    XRenderPictFormat *fmt_win;
-    Picture            pic_win;
-    Pixmap             pm_src;
-    Picture            pic_src;
-    GC                 gc_pm;
-
-    GC      gc_win;
+    int has_shape, has_render, has_comp, use_argb, use_dither;
+    int shape_evbase;
+    int dragging, drag_rx, drag_ry, win_ox, win_oy;
+    XRenderPictFormat *fmtw;
+    Picture picw, pics;
+    Pixmap pms;
+    GC gcpm, gcw;
     XImage *ximg;
-} OverlayCtx;
+    Image *src;
+    double opacity;
+    int cur_maxdim;
+} Ctx;
 
-static void overlay_destroy(OverlayCtx *ctx)
+static void ctx_getpos(Ctx *c, int *ox, int *oy)
 {
-    if (!ctx || !ctx->dpy) return;
-
-    if (ctx->dragging) {
-        XUngrabPointer(ctx->dpy, CurrentTime);
-        ctx->dragging = 0;
-    }
-
-    if (ctx->ximg)        { XDestroyImage(ctx->ximg);                   ctx->ximg    = NULL; }
-    if (ctx->gc_win)      { XFreeGC(ctx->dpy, ctx->gc_win);            ctx->gc_win  = 0;    }
-    if (ctx->pic_src)     { XRenderFreePicture(ctx->dpy, ctx->pic_src); ctx->pic_src = 0;    }
-    if (ctx->pm_src)      { XFreePixmap(ctx->dpy, ctx->pm_src);        ctx->pm_src  = 0;    }
-    if (ctx->pic_win)     { XRenderFreePicture(ctx->dpy, ctx->pic_win); ctx->pic_win = 0;    }
-    if (ctx->gc_pm)       { XFreeGC(ctx->dpy, ctx->gc_pm);             ctx->gc_pm   = 0;    }
-    if (ctx->cursor_move) { XFreeCursor(ctx->dpy, ctx->cursor_move);    ctx->cursor_move = 0;}
-    if (ctx->drag_win)    { XDestroyWindow(ctx->dpy, ctx->drag_win);    ctx->drag_win = 0;   }
-    if (ctx->win)         { XDestroyWindow(ctx->dpy, ctx->win);         ctx->win      = 0;   }
-    if (ctx->cmap)        { XFreeColormap(ctx->dpy, ctx->cmap);         ctx->cmap     = 0;   }
-
-    XCloseDisplay(ctx->dpy);
-    ctx->dpy = NULL;
-}
-
-static void overlay_get_position(OverlayCtx *ctx, int *ox, int *oy)
-{
-    Window child;
+    Window ch;
     int x = 0, y = 0;
-    XTranslateCoordinates(ctx->dpy, ctx->win, ctx->root, 0, 0, &x, &y, &child);
+    XTranslateCoordinates(c->dpy, c->win, c->root, 0, 0, &x, &y, &ch);
     if (ox) *ox = x;
     if (oy) *oy = y;
 }
 
-static void overlay_move(OverlayCtx *ctx, int x, int y)
+static int point_in_win(Ctx *c, int rx, int ry)
 {
-    XMoveWindow(ctx->dpy, ctx->win,      x, y);
-    XMoveWindow(ctx->dpy, ctx->drag_win, x, y);
+    int wx = 0, wy = 0;
+    ctx_getpos(c, &wx, &wy);
+    return rx >= wx && rx < wx + c->w && ry >= wy && ry < wy + c->h;
 }
 
-static void overlay_set_hints(OverlayCtx *ctx)
+static void ctx_sethints(Ctx *c)
 {
-    Atom wm_type = XInternAtom(ctx->dpy, "_NET_WM_WINDOW_TYPE", False);
-    Atom type_util = XInternAtom(ctx->dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
-    if (wm_type != None && type_util != None)
-        XChangeProperty(ctx->dpy, ctx->win, wm_type, XA_ATOM, 32,
-                        PropModeReplace, (unsigned char *)&type_util, 1);
+    Atom wt = XInternAtom(c->dpy, "_NET_WM_WINDOW_TYPE", False);
+    Atom tu = XInternAtom(c->dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+    if (wt && tu)
+        XChangeProperty(c->dpy, c->win, wt, XA_ATOM, 32,
+                        PropModeReplace, (unsigned char *)&tu, 1);
 
-    Atom wm_state = XInternAtom(ctx->dpy, "_NET_WM_STATE", False);
-    Atom state_above = XInternAtom(ctx->dpy, "_NET_WM_STATE_ABOVE", False);
-    if (wm_state != None && state_above != None)
-        XChangeProperty(ctx->dpy, ctx->win, wm_state, XA_ATOM, 32,
-                        PropModeReplace, (unsigned char *)&state_above, 1);
+    Atom ws = XInternAtom(c->dpy, "_NET_WM_STATE", False);
+    Atom sa = XInternAtom(c->dpy, "_NET_WM_STATE_ABOVE", False);
+    if (ws && sa)
+        XChangeProperty(c->dpy, c->win, ws, XA_ATOM, 32,
+                        PropModeReplace, (unsigned char *)&sa, 1);
 
-    XClassHint class_hint;
-    class_hint.res_name  = (char *)"ghostlay";
-    class_hint.res_class = (char *)"Ghostlay";
-    XSetClassHint(ctx->dpy, ctx->win, &class_hint);
+    XClassHint ch;
+    ch.res_name = (char *)"ghostlay";
+    ch.res_class = (char *)"Ghostlay";
+    XSetClassHint(c->dpy, c->win, &ch);
 }
 
-static void overlay_init(OverlayCtx *ctx, int w, int h, int use_dither)
+static void ctx_init(Ctx *c, int w, int h, int dither)
 {
-    memset(ctx, 0, sizeof(*ctx));
+    memset(c, 0, sizeof(*c));
+    c->dpy = XOpenDisplay(NULL);
+    if (!c->dpy) die("cannot open display");
 
-    ctx->dpy = XOpenDisplay(NULL);
-    if (!ctx->dpy) die("cannot open X display (is $DISPLAY set?)");
+    XSetErrorHandler(x_error);
+    XSetIOErrorHandler(xio_error);
 
-    /* Install custom error handler to suppress extension event warnings */
-    XSetErrorHandler(x_error_handler);
+    c->scr = DefaultScreen(c->dpy);
+    c->root = RootWindow(c->dpy, c->scr);
+    c->w = w;
+    c->h = h;
+    c->use_dither = dither;
 
-    ctx->screen = DefaultScreen(ctx->dpy);
-    ctx->root   = RootWindow(ctx->dpy, ctx->screen);
-    ctx->w = w;  ctx->h = h;
-    ctx->drag_handle_size = DRAG_HANDLE_SIZE;
-    ctx->use_dither = use_dither;
+    int sev = 0, ser = 0;
+    c->has_shape = XShapeQueryExtension(c->dpy, &sev, &ser);
+    c->shape_evbase = sev;
 
-    int shape_ev = 0, shape_err = 0;
-    ctx->has_shape = XShapeQueryExtension(ctx->dpy, &shape_ev, &shape_err);
-    ctx->shape_event_base = shape_ev; /* store for event loop filtering */
+    int rev = 0, rer = 0;
+    c->has_render = XRenderQueryExtension(c->dpy, &rev, &rer);
+    c->has_comp = comp_active(c->dpy, c->scr);
 
-    int render_ev = 0, render_err = 0;
-    ctx->has_render = XRenderQueryExtension(ctx->dpy, &render_ev, &render_err);
-    ctx->has_compositor = compositor_active(ctx->dpy, ctx->screen);
-
-    Visual *vis = NULL;
-    int depth = 0;
-    if (!use_dither && ctx->has_render)
-        vis = find_argb_visual(ctx->dpy, ctx->screen, &depth);
-
-    if (vis) {
-        ctx->visual = vis;
-        ctx->depth  = depth;
+    Visual *v = NULL;
+    int dep = 0;
+    if (!dither && c->has_render)
+        v = find_argb(c->dpy, c->scr, &dep);
+    if (v) {
+        c->vis = v;
+        c->depth = dep;
     } else {
-        ctx->visual = DefaultVisual(ctx->dpy, ctx->screen);
-        ctx->depth  = DefaultDepth(ctx->dpy, ctx->screen);
+        c->vis = DefaultVisual(c->dpy, c->scr);
+        c->depth = DefaultDepth(c->dpy, c->scr);
     }
 
-    ctx->use_argb = (!use_dither && ctx->has_render && ctx->depth == 32);
-    ctx->cmap = XCreateColormap(ctx->dpy, ctx->root, ctx->visual, AllocNone);
+    c->use_argb = (!dither && c->has_render && c->depth == 32);
+    c->cmap = XCreateColormap(c->dpy, c->root, c->vis, AllocNone);
 
-    int scr_w = DisplayWidth(ctx->dpy, ctx->screen);
-    int scr_h = DisplayHeight(ctx->dpy, ctx->screen);
-    int pos_x = (scr_w - w) / 2;
-    int pos_y = (scr_h - h) / 2;
-    if (pos_x < 0) pos_x = 0;
-    if (pos_y < 0) pos_y = 0;
+    int sw = DisplayWidth(c->dpy, c->scr);
+    int sh = DisplayHeight(c->dpy, c->scr);
+    int px = (sw - w) / 2;
+    int py = (sh - h) / 2;
+    if (px < 0)
+        px = 0;
+    if (py < 0)
+        py = 0;
 
     XSetWindowAttributes attr;
     memset(&attr, 0, sizeof(attr));
-    attr.colormap         = ctx->cmap;
-    attr.border_pixel     = 0;
+    attr.colormap = c->cmap;
+    attr.border_pixel = 0;
     attr.background_pixel = 0;
     attr.override_redirect = True;
-    attr.event_mask        = ExposureMask | StructureNotifyMask;
+    attr.event_mask = ExposureMask | StructureNotifyMask;
 
-    ctx->win = XCreateWindow(ctx->dpy, ctx->root,
-        pos_x, pos_y, (unsigned)w, (unsigned)h,
-        0, ctx->depth, InputOutput, ctx->visual,
-        CWColormap | CWBorderPixel | CWBackPixel | CWOverrideRedirect | CWEventMask,
-        &attr);
-    if (!ctx->win) die("failed to create overlay window");
+    c->win = XCreateWindow(c->dpy, c->root, px, py,
+                           (unsigned)w, (unsigned)h,
+                           0, c->depth, InputOutput, c->vis,
+                           CWColormap | CWBorderPixel | CWBackPixel
+                           | CWOverrideRedirect | CWEventMask, &attr);
+    if (!c->win) die("cannot create window");
 
-    XStoreName(ctx->dpy, ctx->win, "ghostlay");
-    overlay_set_hints(ctx);
+    XStoreName(c->dpy, c->win, "ghostlay");
+    ctx_sethints(c);
 
-    XSetWindowAttributes dattr;
-    memset(&dattr, 0, sizeof(dattr));
-    dattr.override_redirect = True;
-    dattr.event_mask = ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
-    int hw = (ctx->drag_handle_size < w) ? ctx->drag_handle_size : w;
-    int hh = (ctx->drag_handle_size < h) ? ctx->drag_handle_size : h;
+    c->cur_move = XCreateFontCursor(c->dpy, XC_fleur);
 
-    ctx->drag_win = XCreateWindow(ctx->dpy, ctx->root,
-        pos_x, pos_y, (unsigned)hw, (unsigned)hh,
-        0, 0, InputOnly, CopyFromParent,
-        CWOverrideRedirect | CWEventMask, &dattr);
-    if (!ctx->drag_win) die("failed to create drag handle window");
+    if (c->has_shape)
+        shape_passthrough(c->dpy, c->win);
 
-    ctx->cursor_move = XCreateFontCursor(ctx->dpy, XC_fleur);
-    XDefineCursor(ctx->dpy, ctx->drag_win, ctx->cursor_move);
+    /* Alt+Button1 on root for drag (with and without NumLock) */
+    XGrabButton(c->dpy, Button1, Mod1Mask, c->root, True,
+                ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+                GrabModeAsync, GrabModeAsync, None, c->cur_move);
+    XGrabButton(c->dpy, Button1, Mod1Mask | Mod2Mask, c->root, True,
+                ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+                GrabModeAsync, GrabModeAsync, None, c->cur_move);
 
-    if (ctx->has_shape) {
-        shape_input_passthrough(ctx->dpy, ctx->win);
-    } else {
-        fprintf(stderr, "ghostlay: warning: XShape unavailable, click-through disabled\n");
+    /* Alt+=/-, Alt+KP_Add/Sub, Alt+Q for resize and quit */
+    KeyCode keys[] = {
+        XKeysymToKeycode(c->dpy, XK_plus),
+        XKeysymToKeycode(c->dpy, XK_minus),
+        XKeysymToKeycode(c->dpy, XK_equal),
+        XKeysymToKeycode(c->dpy, XK_KP_Add),
+        XKeysymToKeycode(c->dpy, XK_KP_Subtract),
+        XKeysymToKeycode(c->dpy, XK_q)
+    };
+    unsigned mods[] = {Mod1Mask, Mod1Mask | Mod2Mask};
+    for (int m = 0; m < 2; m++) {
+        for (int k = 0; k < 6; k++) {
+            if (keys[k])
+                XGrabKey(c->dpy, keys[k], mods[m], c->root,
+                         True, GrabModeAsync, GrabModeAsync);
+        }
     }
 
-    if (use_dither)
-        fprintf(stderr, "ghostlay: dither + XShape transparency enabled\n");
-    else if (!ctx->has_compositor)
-        fprintf(stderr, "ghostlay: no compositor — use -d for dithered transparency, or run picom\n");
-
-    if (ctx->use_argb) {
-        ctx->fmt_win = XRenderFindVisualFormat(ctx->dpy, ctx->visual);
-        if (!ctx->fmt_win) die("XRenderFindVisualFormat failed");
+    if (c->use_argb) {
+        c->fmtw = XRenderFindVisualFormat(c->dpy, c->vis);
+        if (!c->fmtw) die("XRender format failed");
         XRenderPictureAttributes pa;
         memset(&pa, 0, sizeof(pa));
-        ctx->pic_win = XRenderCreatePicture(ctx->dpy, ctx->win, ctx->fmt_win, 0, &pa);
-        if (!ctx->pic_win) die("XRenderCreatePicture failed");
+        c->picw = XRenderCreatePicture(c->dpy, c->win, c->fmtw, 0, &pa);
     } else {
-        ctx->gc_win = XCreateGC(ctx->dpy, ctx->win, 0, NULL);
-        if (!ctx->gc_win) die("XCreateGC failed");
+        c->gcw = XCreateGC(c->dpy, c->win, 0, NULL);
     }
 
-    XMapRaised(ctx->dpy, ctx->win);
-    XMapRaised(ctx->dpy, ctx->drag_win);
-    XFlush(ctx->dpy);
+    if (dither)
+        fprintf(stderr, "ghostlay: dither+XShape mode\n");
+    else if (!c->has_comp)
+        fprintf(stderr, "ghostlay: no compositor, use -d or picom\n");
+
+    XMapRaised(c->dpy, c->win);
+    XFlush(c->dpy);
 }
 
-/* ========================================================================== */
-/*  Drawing: XRender ARGB path                                                */
-/* ========================================================================== */
-
-static void overlay_upload_argb(OverlayCtx *ctx, const uint8_t *rgba, double opacity)
+static void ctx_destroy(Ctx *c)
 {
-    if (!ctx->use_argb) return;
-    if (opacity < OPACITY_MIN_FACTOR) opacity = OPACITY_MIN_FACTOR;
-    if (opacity > 1.0) opacity = 1.0;
-
-    if (ctx->pic_src) { XRenderFreePicture(ctx->dpy, ctx->pic_src); ctx->pic_src = 0; }
-    if (ctx->pm_src)  { XFreePixmap(ctx->dpy, ctx->pm_src);         ctx->pm_src  = 0; }
-
-    ctx->pm_src = XCreatePixmap(ctx->dpy, ctx->win,
-                                (unsigned)ctx->w, (unsigned)ctx->h, 32);
-    if (!ctx->pm_src) die("XCreatePixmap failed");
-
-    if (!ctx->gc_pm) {
-        ctx->gc_pm = XCreateGC(ctx->dpy, ctx->pm_src, 0, NULL);
-        if (!ctx->gc_pm) die("XCreateGC failed for pixmap");
+    if (!c || !c->dpy) return;
+    if (c->dragging) {
+        XUngrabPointer(c->dpy, CurrentTime);
+        c->dragging = 0;
     }
+    XUngrabButton(c->dpy, Button1, AnyModifier, c->root);
+    XUngrabKey(c->dpy, AnyKey, AnyModifier, c->root);
+    if (c->ximg) { XDestroyImage(c->ximg); c->ximg = NULL; }
+    if (c->gcw) { XFreeGC(c->dpy, c->gcw); c->gcw = 0; }
+    if (c->pics) { XRenderFreePicture(c->dpy, c->pics); c->pics = 0; }
+    if (c->pms) { XFreePixmap(c->dpy, c->pms); c->pms = 0; }
+    if (c->picw) { XRenderFreePicture(c->dpy, c->picw); c->picw = 0; }
+    if (c->gcpm) { XFreeGC(c->dpy, c->gcpm); c->gcpm = 0; }
+    if (c->cur_move) { XFreeCursor(c->dpy, c->cur_move); c->cur_move = 0; }
+    if (c->win) { XDestroyWindow(c->dpy, c->win); c->win = 0; }
+    if (c->cmap) { XFreeColormap(c->dpy, c->cmap); c->cmap = 0; }
+    XCloseDisplay(c->dpy);
+    c->dpy = NULL;
+}
 
-    XImage *xi = XCreateImage(ctx->dpy, ctx->visual, 32, ZPixmap, 0, NULL,
-                              (unsigned)ctx->w, (unsigned)ctx->h, 32, 0);
+/* --- drawing --- */
+
+static void upload_argb(Ctx *c, const uint8_t *rgba, double op)
+{
+    if (!c->use_argb) return;
+    if (op < OPACITY_MIN) op = OPACITY_MIN;
+    if (op > 1) op = 1;
+
+    if (c->pics) { XRenderFreePicture(c->dpy, c->pics); c->pics = 0; }
+    if (c->pms) { XFreePixmap(c->dpy, c->pms); c->pms = 0; }
+
+    c->pms = XCreatePixmap(c->dpy, c->win,
+                           (unsigned)c->w, (unsigned)c->h, 32);
+    if (!c->gcpm)
+        c->gcpm = XCreateGC(c->dpy, c->pms, 0, NULL);
+
+    XImage *xi = XCreateImage(c->dpy, c->vis, 32, ZPixmap, 0, NULL,
+                              (unsigned)c->w, (unsigned)c->h, 32, 0);
     if (!xi) die("XCreateImage failed");
 
-    size_t datasz = (size_t)xi->bytes_per_line * (size_t)xi->height;
-    xi->data = (char *)xmalloc(datasz);
-    memset(xi->data, 0, datasz);
+    size_t ds = (size_t)xi->bytes_per_line * xi->height;
+    xi->data = (char *)xmalloc(ds);
+    memset(xi->data, 0, ds);
 
-    PixelFormat pf = pixel_format_from_ximage(xi, ctx->fmt_win);
-    const int use_alpha = ctx->has_compositor;
-
-    for (int y = 0; y < ctx->h; y++) {
-        for (int x = 0; x < ctx->w; x++) {
-            const uint8_t *p = rgba + 4 * ((size_t)y * ctx->w + x);
-            uint8_t sr = p[0], sg = p[1], sb = p[2], sa = p[3];
-            uint8_t a8, r8, g8, b8;
-
-            if (use_alpha) {
-                int a_eff = (int)lround((double)sa * opacity);
-                a8 = clamp_u8(a_eff);
-                r8 = (uint8_t)(((unsigned)sr * a8 + 127u) / 255u);
-                g8 = (uint8_t)(((unsigned)sg * a8 + 127u) / 255u);
-                b8 = (uint8_t)(((unsigned)sb * a8 + 127u) / 255u);
+    PxFmt pf = make_pxfmt(xi, c->fmtw);
+    int ua = c->has_comp;
+    for (int y = 0; y < c->h; y++) {
+        for (int x = 0; x < c->w; x++) {
+            const uint8_t *p = rgba + 4 * ((size_t)y * c->w + x);
+            uint8_t r, g, b, a;
+            if (ua) {
+                a = clamp8((int)lround((double)p[3] * op));
+                r = (uint8_t)(((unsigned)p[0] * a + 127) / 255);
+                g = (uint8_t)(((unsigned)p[1] * a + 127) / 255);
+                b = (uint8_t)(((unsigned)p[2] * a + 127) / 255);
             } else {
-                a8 = 255;
-                r8 = clamp_u8((int)lround((double)sr * opacity));
-                g8 = clamp_u8((int)lround((double)sg * opacity));
-                b8 = clamp_u8((int)lround((double)sb * opacity));
+                a = 255;
+                r = clamp8((int)lround(p[0] * op));
+                g = clamp8((int)lround(p[1] * op));
+                b = clamp8((int)lround(p[2] * op));
             }
-
-            uint32_t pix = pack_pixel(&pf, r8, g8, b8, a8);
-            put_pixel_fast(xi->data, xi->bytes_per_line, x, y, pix, pf.bpp);
+            putpx(xi->data, xi->bytes_per_line, x, y,
+                  packpx(&pf, r, g, b, a), pf.bpp);
         }
     }
 
-    XPutImage(ctx->dpy, ctx->pm_src, ctx->gc_pm, xi, 0, 0, 0, 0,
-              (unsigned)ctx->w, (unsigned)ctx->h);
+    XPutImage(c->dpy, c->pms, c->gcpm, xi,
+              0, 0, 0, 0, (unsigned)c->w, (unsigned)c->h);
     XDestroyImage(xi);
 
-    XRenderPictFormat *fmt_src = XRenderFindStandardFormat(ctx->dpy, PictStandardARGB32);
-    if (!fmt_src) fmt_src = ctx->fmt_win;
-
+    XRenderPictFormat *fs = XRenderFindStandardFormat(c->dpy, PictStandardARGB32);
+    if (!fs) fs = c->fmtw;
     XRenderPictureAttributes pa;
     memset(&pa, 0, sizeof(pa));
-    ctx->pic_src = XRenderCreatePicture(ctx->dpy, ctx->pm_src, fmt_src, 0, &pa);
-    if (!ctx->pic_src) die("XRenderCreatePicture failed for source");
+    c->pics = XRenderCreatePicture(c->dpy, c->pms, fs, 0, &pa);
 }
 
-static void overlay_draw_argb(OverlayCtx *ctx)
+static void draw_argb(Ctx *c)
 {
-    if (!ctx->use_argb || !ctx->pic_src) return;
-    XRenderColor clear = {0, 0, 0, 0};
-    XRenderFillRectangle(ctx->dpy, PictOpClear, ctx->pic_win, &clear,
-                         0, 0, (unsigned)ctx->w, (unsigned)ctx->h);
-    XRenderComposite(ctx->dpy, PictOpSrc, ctx->pic_src, None, ctx->pic_win,
-                     0, 0, 0, 0, 0, 0, (unsigned)ctx->w, (unsigned)ctx->h);
+    if (!c->use_argb || !c->pics) return;
+    XRenderColor cl = {0, 0, 0, 0};
+    XRenderFillRectangle(c->dpy, PictOpClear, c->picw, &cl,
+                         0, 0, (unsigned)c->w, (unsigned)c->h);
+    XRenderComposite(c->dpy, PictOpSrc, c->pics, None, c->picw,
+                     0, 0, 0, 0, 0, 0, (unsigned)c->w, (unsigned)c->h);
 }
 
-/* ========================================================================== */
-/*  Drawing: non-ARGB path (fallback and dither)                              */
-/* ========================================================================== */
-
-static void overlay_build_ximage(OverlayCtx *ctx, const uint8_t *rgba, double opacity)
+static void build_ximg(Ctx *c, const uint8_t *rgba, double op)
 {
-    if (ctx->use_argb) return;
-    if (opacity < OPACITY_MIN_FACTOR) opacity = OPACITY_MIN_FACTOR;
-    if (opacity > 1.0) opacity = 1.0;
+    if (c->use_argb) return;
+    if (op < OPACITY_MIN) op = OPACITY_MIN;
+    if (op > 1) op = 1;
+    if (c->ximg) { XDestroyImage(c->ximg); c->ximg = NULL; }
 
-    if (ctx->ximg) { XDestroyImage(ctx->ximg); ctx->ximg = NULL; }
-
-    XImage *xi = XCreateImage(ctx->dpy, ctx->visual, (unsigned)ctx->depth,
+    XImage *xi = XCreateImage(c->dpy, c->vis, (unsigned)c->depth,
                               ZPixmap, 0, NULL,
-                              (unsigned)ctx->w, (unsigned)ctx->h, 32, 0);
+                              (unsigned)c->w, (unsigned)c->h, 32, 0);
     if (!xi) die("XCreateImage failed");
 
-    size_t datasz = (size_t)xi->bytes_per_line * (size_t)xi->height;
-    xi->data = (char *)xmalloc(datasz);
-    memset(xi->data, 0, datasz);
+    size_t ds = (size_t)xi->bytes_per_line * xi->height;
+    xi->data = (char *)xmalloc(ds);
+    memset(xi->data, 0, ds);
 
-    PixelFormat pf = pixel_format_from_ximage(xi, NULL);
-    const int is_dither = ctx->use_dither;
-
-    for (int y = 0; y < ctx->h; y++) {
-        for (int x = 0; x < ctx->w; x++) {
-            const uint8_t *p = rgba + 4 * ((size_t)y * ctx->w + x);
+    PxFmt pf = make_pxfmt(xi, NULL);
+    for (int y = 0; y < c->h; y++) {
+        for (int x = 0; x < c->w; x++) {
+            const uint8_t *p = rgba + 4 * ((size_t)y * c->w + x);
             uint8_t r, g, b;
-
-            if (is_dither) {
+            if (c->use_dither) {
                 r = p[0]; g = p[1]; b = p[2];
             } else {
-                r = clamp_u8((int)lround((double)p[0] * opacity));
-                g = clamp_u8((int)lround((double)p[1] * opacity));
-                b = clamp_u8((int)lround((double)p[2] * opacity));
+                r = clamp8((int)lround(p[0] * op));
+                g = clamp8((int)lround(p[1] * op));
+                b = clamp8((int)lround(p[2] * op));
             }
-
-            uint32_t pix = pack_pixel(&pf, r, g, b, 255);
-            put_pixel_fast(xi->data, xi->bytes_per_line, x, y, pix, pf.bpp);
+            putpx(xi->data, xi->bytes_per_line, x, y,
+                  packpx(&pf, r, g, b, 255), pf.bpp);
         }
     }
-    ctx->ximg = xi;
+    c->ximg = xi;
 }
 
-static void overlay_draw_ximage(OverlayCtx *ctx)
+static void draw_ximg(Ctx *c)
 {
-    if (ctx->use_argb || !ctx->ximg) return;
-    XPutImage(ctx->dpy, ctx->win, ctx->gc_win, ctx->ximg,
-              0, 0, 0, 0, (unsigned)ctx->w, (unsigned)ctx->h);
+    if (c->use_argb || !c->ximg) return;
+    XPutImage(c->dpy, c->win, c->gcw, c->ximg,
+              0, 0, 0, 0, (unsigned)c->w, (unsigned)c->h);
 }
 
-/* ========================================================================== */
-/*  Unified redraw                                                            */
-/* ========================================================================== */
-
-static void overlay_redraw(OverlayCtx *ctx)
+static void apply_shape(Ctx *c, const uint8_t *rgba, double op)
 {
-    if (ctx->use_argb) overlay_draw_argb(ctx);
-    else               overlay_draw_ximage(ctx);
-    XRaiseWindow(ctx->dpy, ctx->win);
-    XRaiseWindow(ctx->dpy, ctx->drag_win);
-    XFlush(ctx->dpy);
-}
-
-static void overlay_apply_bounding_shape(OverlayCtx *ctx,
-                                         const uint8_t *rgba, double opacity)
-{
-    if (!ctx->has_shape) return;
-    Pixmap pm;
-    if (ctx->use_dither)
-        pm = shape_mask_dithered(ctx->dpy, ctx->win, rgba, ctx->w, ctx->h, opacity);
-    else
-        pm = shape_mask_from_alpha(ctx->dpy, ctx->win, rgba, ctx->w, ctx->h);
+    if (!c->has_shape) return;
+    Pixmap pm = c->use_dither
+        ? mask_dither(c->dpy, c->win, rgba, c->w, c->h, op)
+        : mask_alpha(c->dpy, c->win, rgba, c->w, c->h);
     if (!pm) return;
-    XShapeCombineMask(ctx->dpy, ctx->win, ShapeBounding, 0, 0, pm, ShapeSet);
-    XFreePixmap(ctx->dpy, pm);
+    XShapeCombineMask(c->dpy, c->win, ShapeBounding, 0, 0, pm, ShapeSet);
+    XFreePixmap(c->dpy, pm);
 }
 
-/* ========================================================================== */
-/*  Self-pipe drain                                                           */
-/* ========================================================================== */
+static void redraw(Ctx *c)
+{
+    if (c->use_argb) draw_argb(c);
+    else draw_ximg(c);
+    XRaiseWindow(c->dpy, c->win);
+    XFlush(c->dpy);
+}
 
-static void drain_wake_pipe(void)
+static void rebuild_at_size(Ctx *c, int new_maxdim)
+{
+    if (new_maxdim < MIN_DIM) new_maxdim = MIN_DIM;
+    if (new_maxdim > MAX_SCALE_DIM) new_maxdim = MAX_SCALE_DIM;
+    c->cur_maxdim = new_maxdim;
+
+    Image scaled = scale_bilinear(c->src, new_maxdim);
+
+    if (c->ximg) { XDestroyImage(c->ximg); c->ximg = NULL; }
+    if (c->pics) { XRenderFreePicture(c->dpy, c->pics); c->pics = 0; }
+    if (c->pms) { XFreePixmap(c->dpy, c->pms); c->pms = 0; }
+
+    c->w = scaled.w;
+    c->h = scaled.h;
+    XResizeWindow(c->dpy, c->win, (unsigned)c->w, (unsigned)c->h);
+
+    if (c->has_shape)
+        shape_passthrough(c->dpy, c->win);
+
+    if (c->use_argb) {
+        upload_argb(c, scaled.rgba, c->opacity);
+        if (!c->has_comp)
+            apply_shape(c, scaled.rgba, c->opacity);
+    } else {
+        build_ximg(c, scaled.rgba, c->opacity);
+        apply_shape(c, scaled.rgba, c->opacity);
+    }
+
+    redraw(c);
+    image_free(&scaled);
+    fprintf(stderr, "ghostlay: resized %dx%d\n", c->w, c->h);
+}
+
+/* --- drain pipe --- */
+
+static void drain_pipe(void)
 {
     if (g_wake_rd < 0) return;
-    uint8_t buf[64];
-    while (read(g_wake_rd, buf, sizeof(buf)) > 0) ;
+    uint8_t b[64];
+    while (read(g_wake_rd, b, 64) > 0)
+        ;
 }
 
-/* ========================================================================== */
-/*  Event loop                                                                */
-/* ========================================================================== */
+/* --- event loop --- */
 
-static void overlay_loop(OverlayCtx *ctx)
+static void run_loop(Ctx *c)
 {
-    const int xfd = ConnectionNumber(ctx->dpy);
-    int raise_counter = 0;
+    int xfd = ConnectionNumber(c->dpy);
+    int tick = 0;
 
     while (g_running) {
-        while (XPending(ctx->dpy) > 0) {
+        while (XPending(c->dpy) > 0) {
             XEvent ev;
-            XNextEvent(ctx->dpy, &ev);
+            XNextEvent(c->dpy, &ev);
 
-            /*
-             * Silently ignore XShape extension events (ShapeNotify).
-             * These are generated when the shape of our window changes
-             * and have event type = shape_event_base + ShapeNotify.
-             * Xlib prints "ignoring invalid extension event" if we
-             * don't handle them, which we suppress via XSetErrorHandler,
-             * but we also skip them here to avoid the switch default.
-             */
-            if (ctx->has_shape && ev.type >= ctx->shape_event_base &&
-                ev.type < ctx->shape_event_base + 2) {
+            if (c->has_shape && ev.type >= c->shape_evbase
+                && ev.type < c->shape_evbase + 2)
                 continue;
-            }
 
             switch (ev.type) {
             case Expose:
-                if (ev.xexpose.count == 0) overlay_redraw(ctx);
+                if (!ev.xexpose.count) redraw(c);
                 break;
+
+            case KeyPress: {
+                KeySym ks = XLookupKeysym(&ev.xkey, 0);
+                if (ks == XK_plus || ks == XK_equal || ks == XK_KP_Add)
+                    rebuild_at_size(c, c->cur_maxdim + RESIZE_STEP);
+                else if (ks == XK_minus || ks == XK_KP_Subtract)
+                    rebuild_at_size(c, c->cur_maxdim - RESIZE_STEP);
+                else if (ks == XK_q || ks == XK_Q)
+                    g_running = 0;
+                break;
+            }
+
             case ButtonPress:
-                if (ev.xbutton.window == ctx->drag_win && ev.xbutton.button == Button1) {
-                    ctx->dragging = 1;
-                    ctx->drag_origin_rx = ev.xbutton.x_root;
-                    ctx->drag_origin_ry = ev.xbutton.y_root;
-                    overlay_get_position(ctx, &ctx->win_origin_x, &ctx->win_origin_y);
-                    XGrabPointer(ctx->dpy, ctx->drag_win, False,
-                                 PointerMotionMask | ButtonReleaseMask,
-                                 GrabModeAsync, GrabModeAsync,
-                                 None, ctx->cursor_move, CurrentTime);
+                if (ev.xbutton.button == Button1
+                    && point_in_win(c, ev.xbutton.x_root, ev.xbutton.y_root))
+                {
+                    c->dragging = 1;
+                    c->drag_rx = ev.xbutton.x_root;
+                    c->drag_ry = ev.xbutton.y_root;
+                    ctx_getpos(c, &c->win_ox, &c->win_oy);
                 }
                 break;
+
             case MotionNotify:
-                if (ctx->dragging) {
-                    XEvent latest = ev, tmp;
-                    while (XCheckTypedWindowEvent(ctx->dpy, ctx->drag_win, MotionNotify, &tmp))
-                        latest = tmp;
-                    int dx = latest.xmotion.x_root - ctx->drag_origin_rx;
-                    int dy = latest.xmotion.y_root - ctx->drag_origin_ry;
-                    overlay_move(ctx, ctx->win_origin_x + dx, ctx->win_origin_y + dy);
-                    XRaiseWindow(ctx->dpy, ctx->win);
-                    XRaiseWindow(ctx->dpy, ctx->drag_win);
-                    XFlush(ctx->dpy);
+                if (c->dragging) {
+                    XEvent last = ev, tmp;
+                    while (XCheckTypedEvent(c->dpy, MotionNotify, &tmp))
+                        last = tmp;
+                    int dx = last.xmotion.x_root - c->drag_rx;
+                    int dy = last.xmotion.y_root - c->drag_ry;
+                    XMoveWindow(c->dpy, c->win, c->win_ox + dx, c->win_oy + dy);
+                    XRaiseWindow(c->dpy, c->win);
+                    XFlush(c->dpy);
                 }
                 break;
+
             case ButtonRelease:
-                if (ev.xbutton.window == ctx->drag_win && ev.xbutton.button == Button1) {
-                    ctx->dragging = 0;
-                    XUngrabPointer(ctx->dpy, CurrentTime);
-                }
+                if (ev.xbutton.button == Button1 && c->dragging)
+                    c->dragging = 0;
                 break;
+
             default:
                 break;
             }
         }
 
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(xfd, &rfds);
-        int maxfd = xfd;
+        if (!g_running) break;
+
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(xfd, &rf);
+        int mx = xfd;
         if (g_wake_rd >= 0) {
-            FD_SET(g_wake_rd, &rfds);
-            if (g_wake_rd > maxfd) maxfd = g_wake_rd;
+            FD_SET(g_wake_rd, &rf);
+            if (g_wake_rd > mx) mx = g_wake_rd;
         }
 
         struct timeval tv;
-        tv.tv_sec  = 0;
-        tv.tv_usec = SELECT_TIMEOUT_USEC;
+        tv.tv_sec = 0;
+        tv.tv_usec = SELECT_US;
 
-        int ret = select(maxfd + 1, &rfds, NULL, NULL, &tv);
-        if (ret < 0) {
+        int r = select(mx + 1, &rf, NULL, NULL, &tv);
+        if (r < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "ghostlay: select error: %s\n", strerror(errno));
             break;
         }
-
-        if (g_wake_rd >= 0 && FD_ISSET(g_wake_rd, &rfds)) {
-            drain_wake_pipe();
+        if (g_wake_rd >= 0 && FD_ISSET(g_wake_rd, &rf)) {
+            drain_pipe();
             break;
         }
-
         if (!g_running) break;
 
-        raise_counter++;
-        if (raise_counter >= RAISE_INTERVAL_TICKS) {
-            raise_counter = 0;
-            XRaiseWindow(ctx->dpy, ctx->win);
-            XRaiseWindow(ctx->dpy, ctx->drag_win);
-            XFlush(ctx->dpy);
+        tick++;
+        if (tick >= RAISE_TICKS) {
+            tick = 0;
+            XRaiseWindow(c->dpy, c->win);
+            XFlush(c->dpy);
         }
     }
 }
 
-/* ========================================================================== */
-/*  Usage                                                                     */
-/* ========================================================================== */
+/* --- usage --- */
 
-static void print_usage(FILE *out)
+static void usage(FILE *o)
 {
-    fprintf(out,
-        "ghostlay v%s — floating click-through image overlay for X11\n"
-        "\n"
-        "Usage:\n"
-        "  ghostlay [-o 0..10] [-s PX] [-d] <image.(png|jpg|jpeg)>\n"
-        "\n"
-        "Options:\n"
-        "  -o N   Opacity level 0..10 (10 = fully visible, 0 = near invisible)\n"
-        "  -s PX  Scale to max dimension PX pixels (preserves aspect ratio)\n"
-        "  -d     Dither transparency (works without compositor, ideal for i3wm)\n"
-        "  -h     Show this help\n"
-        "\n"
+    fprintf(o,
+        "ghostlay v%s — click-through image overlay for X11\n\n"
+        "Usage: ghostlay [-o 0..10] [-s PX] [-d] <image>\n\n"
+        "  -o N   Opacity 0..10 (default 10)\n"
+        "  -s PX  Max dimension in pixels\n"
+        "  -d     Dither transparency (no compositor needed)\n"
+        "  -h     Help\n\n"
         "Controls:\n"
-        "  Drag the top-left corner to reposition the overlay.\n"
-        "\n"
-        "Exit:\n"
-        "  Foreground: Ctrl+C\n"
-        "  Background: kill $(pidof ghostlay)\n"
-        "              killall ghostlay\n"
-        "\n"
+        "  Alt + Drag        Move overlay\n"
+        "  Alt + Plus/Minus  Resize overlay\n"
+        "  Alt + Q           Quit (works even in background)\n"
+        "  Ctrl+C / SIGTERM  Quit (foreground only)\n\n"
+        "Background exit:\n"
+        "  Alt+Q  or  killall ghostlay\n\n"
         "Examples:\n"
-        "  ghostlay -o 5 -s 500 reference.png           (with compositor)\n"
-        "  ghostlay -d -o 4 -s 400 reference.png        (i3wm, no compositor)\n"
-        "  ghostlay -d -o 3 -s 300 sketch.jpg &         (background mode)\n"
-        "\n"
-        "Notes:\n"
-        "  With compositor (picom, xfwm4, kwin, mutter): true alpha blending.\n"
-        "  With -d: ordered dithering via XShape (no compositor needed).\n"
-        "  Without either: fallback dimmed rendering with shape holes.\n"
-        "\n"
-        "  IMPORTANT: When using with a compositor in background mode:\n"
-        "    ghostlay -o 5 -s 500 image.png &\n"
-        "    picom &\n"
-        "  Start them separately so each can be killed independently.\n",
-        GHOSTLAY_VERSION
-    );
+        "  ghostlay -o 5 -s 500 ref.png\n"
+        "  ghostlay -d -o 4 -s 400 ref.png\n"
+        "  ghostlay -o 6 -s 800 img.jpg &\n",
+        VERSION);
 }
 
-/* ========================================================================== */
-/*  PID file                                                                  */
-/* ========================================================================== */
+/* --- pid file --- */
 
-static char g_pid_path[512] = {0};
+static char g_pidpath[512] = {0};
 
-static void write_pid_file(void)
+static void write_pid(void)
 {
-    const char *runtime = getenv("XDG_RUNTIME_DIR");
-    if (!runtime) runtime = "/tmp";
-    snprintf(g_pid_path, sizeof(g_pid_path), "%s/ghostlay.pid", runtime);
-    FILE *f = fopen(g_pid_path, "w");
-    if (f) { fprintf(f, "%d\n", (int)getpid()); fclose(f); }
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt) rt = "/tmp";
+    snprintf(g_pidpath, 512, "%s/ghostlay.pid", rt);
+    FILE *f = fopen(g_pidpath, "w");
+    if (f) {
+        fprintf(f, "%d\n", (int)getpid());
+        fclose(f);
+    }
 }
 
-static void remove_pid_file(void)
+static void rm_pid(void)
 {
-    if (g_pid_path[0]) unlink(g_pid_path);
+    if (g_pidpath[0]) unlink(g_pidpath);
 }
 
-/* ========================================================================== */
-/*  Main                                                                      */
-/* ========================================================================== */
+/* --- main --- */
 
 int main(int argc, char **argv)
 {
-    int opacity_level = 10;
-    int target_size   = 0;
-    int use_dither    = 0;
-    int opt;
+    int olev = 10, tsz = 0, dith = 0, opt;
 
     while ((opt = getopt(argc, argv, "o:s:dh")) != -1) {
         switch (opt) {
         case 'o': {
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (!end || *end != '\0') {
-                fprintf(stderr, "ghostlay: invalid opacity value '%s'\n", optarg);
+            char *e;
+            long v = strtol(optarg, &e, 10);
+            if (!e || *e) {
+                fprintf(stderr, "ghostlay: bad -o\n");
                 return 2;
             }
-            if (v < 0)  v = 0;
+            if (v < 0) v = 0;
             if (v > 10) v = 10;
-            opacity_level = (int)v;
+            olev = (int)v;
             break;
         }
         case 's': {
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (!end || *end != '\0' || v <= 0) {
-                fprintf(stderr, "ghostlay: invalid size value '%s'\n", optarg);
+            char *e;
+            long v = strtol(optarg, &e, 10);
+            if (!e || *e || v <= 0) {
+                fprintf(stderr, "ghostlay: bad -s\n");
                 return 2;
             }
             if (v > MAX_SCALE_DIM) v = MAX_SCALE_DIM;
-            target_size = (int)v;
+            tsz = (int)v;
             break;
         }
         case 'd':
-            use_dither = 1;
+            dith = 1;
             break;
         case 'h':
-            print_usage(stdout);
+            usage(stdout);
             return 0;
         default:
-            print_usage(stderr);
+            usage(stderr);
             return 2;
         }
     }
 
     if (optind >= argc) {
-        print_usage(stderr);
+        usage(stderr);
         return 2;
     }
-
-    const char *image_path = argv[optind];
-
-    if (access(image_path, R_OK) != 0) {
-        fprintf(stderr, "ghostlay: cannot access '%s': %s\n",
-                image_path, strerror(errno));
+    const char *path = argv[optind];
+    if (access(path, R_OK)) {
+        fprintf(stderr, "ghostlay: %s: %s\n", path, strerror(errno));
         return 1;
     }
 
-    write_pid_file();
+    /* Auto-exit when parent shell dies (Linux-specific, safe no-op elsewhere) */
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    if (getppid() == 1) {
+        fprintf(stderr, "ghostlay: parent already gone\n");
+        return 0;
+    }
+
+    write_pid();
 
     int pfd[2];
-    if (pipe(pfd) == 0) {
+    if (!pipe(pfd)) {
         g_wake_rd = pfd[0];
         g_wake_wr = pfd[1];
         fcntl(g_wake_rd, F_SETFL, O_NONBLOCK);
@@ -1340,54 +1172,55 @@ int main(int argc, char **argv)
         fcntl(g_wake_wr, F_SETFD, FD_CLOEXEC);
     }
 
-    /*
-     * Signal handlers for SIGINT, SIGTERM, SIGHUP.
-     * SA_RESTART is NOT set: select() will return EINTR on signal delivery,
-     * which we handle by checking g_running.
-     * SIGHUP: clean exit when terminal closes (background mode).
-     */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
+    sa.sa_handler = sig_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGHUP,  &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
 
-    Image src    = load_image(image_path);
-    Image scaled = scale_bilinear(&src, target_size);
+    Image src = load_image(path);
+    Image scaled = scale_bilinear(&src, tsz);
 
-    fprintf(stderr, "ghostlay: loaded %dx%d -> %dx%d, opacity %d/10%s (pid %d)\n",
-            src.w, src.h, scaled.w, scaled.h, opacity_level,
-            use_dither ? ", dither" : "", (int)getpid());
+    double op = olev == 0 ? OPACITY_MIN : (double)olev / 10.0;
 
-    double opacity = (opacity_level == 0) ? OPACITY_MIN_FACTOR
-                                          : (double)opacity_level / 10.0;
+    /*
+     * cur_maxdim tracks the current longer side of the displayed image.
+     * This is the value that Alt+/- adjusts by RESIZE_STEP.
+     */
+    int cur_maxdim = scaled.w > scaled.h ? scaled.w : scaled.h;
 
-    OverlayCtx ctx;
-    overlay_init(&ctx, scaled.w, scaled.h, use_dither);
+    fprintf(stderr, "ghostlay: %dx%d -> %dx%d, opacity %d/10%s (pid %d)\n",
+            src.w, src.h, scaled.w, scaled.h, olev,
+            dith ? ", dither" : "", (int)getpid());
+    fprintf(stderr, "ghostlay: Alt+Drag=move  Alt+/-=resize  Alt+Q=quit\n");
+
+    Ctx ctx;
+    ctx_init(&ctx, scaled.w, scaled.h, dith);
+    ctx.src = &src;
+    ctx.opacity = op;
+    ctx.cur_maxdim = cur_maxdim;
 
     if (ctx.use_argb) {
-        overlay_upload_argb(&ctx, scaled.rgba, opacity);
-        if (!ctx.has_compositor)
-            overlay_apply_bounding_shape(&ctx, scaled.rgba, opacity);
+        upload_argb(&ctx, scaled.rgba, op);
+        if (!ctx.has_comp)
+            apply_shape(&ctx, scaled.rgba, op);
     } else {
-        overlay_build_ximage(&ctx, scaled.rgba, opacity);
-        overlay_apply_bounding_shape(&ctx, scaled.rgba, opacity);
+        build_ximg(&ctx, scaled.rgba, op);
+        apply_shape(&ctx, scaled.rgba, op);
     }
 
-    overlay_redraw(&ctx);
-    overlay_loop(&ctx);
+    redraw(&ctx);
+    run_loop(&ctx);
 
-    overlay_destroy(&ctx);
+    ctx_destroy(&ctx);
     image_free(&src);
     image_free(&scaled);
-
     if (g_wake_rd >= 0) close(g_wake_rd);
     if (g_wake_wr >= 0) close(g_wake_wr);
-
-    remove_pid_file();
-    fprintf(stderr, "ghostlay: exiting cleanly\n");
+    rm_pid();
+    fprintf(stderr, "ghostlay: exit\n");
     return 0;
 }
