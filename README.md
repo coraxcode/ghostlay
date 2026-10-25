@@ -2,6 +2,7 @@ Install packages:
 
 sudo apt update
 sudo apt install libxrender-dev libx11-dev
+sudo apt install libpng-dev
 
 Compilation:
 
